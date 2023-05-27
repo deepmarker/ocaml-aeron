@@ -1,0 +1,4 @@
+(test
+ (name aeron)
+ (libraries aeron)
+)
