@@ -13,7 +13,13 @@ let subscribe timeout prefix chan streamID =
   (match subscription_status sub with
    | 1 -> printf "Subscription OK\n"
    | _ -> assert false);
+  let consts = subscription_consts sub in
+  Format.printf "%a@." Sexp.pp (sexp_of_subscription_consts consts);
   let terminate = Ivar.create () in
+  let cb buf hdr =
+    Format.printf "(%a) %s\n%!" Sexp.pp (sexp_of_header hdr) (Bigstring.to_string buf)
+  in
+  don't_wait_for (Aeron_async.poll ~stop:(Ivar.read terminate) sub cb);
   let cleanup =
     Ivar.read terminate
     >>= fun () ->

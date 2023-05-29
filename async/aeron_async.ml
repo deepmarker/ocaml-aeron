@@ -1,3 +1,4 @@
+open Core
 open Async
 open Aeron
 
@@ -37,6 +38,18 @@ let close_subscription t =
     match subscription_is_closed t with
     | true -> Deferred.unit
     | false -> Scheduler.yield () >>= loop
+  in
+  loop ()
+;;
+
+let poll ?stop t cb =
+  let assembler = fragment_assembler_create cb in
+  let rec loop () =
+    let nb_fragments = subscription_poll t assembler 10 in
+    (* printf "got %d frags\n" nb_fragments; *)
+    match stop with
+    | Some iv when Deferred.is_determined iv -> Deferred.unit
+    | _ -> Clock_ns.after (Time_ns.Span.of_int_ms nb_fragments) >>= loop
   in
   loop ()
 ;;

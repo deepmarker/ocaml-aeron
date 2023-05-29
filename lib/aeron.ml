@@ -1,3 +1,5 @@
+open Sexplib.Std
+
 type context
 type t
 type add_publication
@@ -86,3 +88,48 @@ external subscription_status
   :  subscription
   -> int
   = "ml_aeron_subscription_channel_status"
+
+type subscription_consts =
+  { channel : string
+  ; registration_id : int64
+  ; stream_id : int32
+  ; channel_status_indicator_id : int32
+  }
+[@@deriving sexp]
+
+external subscription_consts
+  :  subscription
+  -> subscription_consts
+  = "ml_aeron_subscription_constants"
+
+type header =
+  { frame : frame
+  ; initial_term_id : int32
+  ; position_bits_to_shift : int
+  }
+
+and frame =
+  { frame_length : int32
+  ; version : int
+  ; flags : int
+  ; typ : int
+  ; term_offset : int32
+  ; session_id : int32
+  ; stream_id : int32
+  ; term_id : int32
+  }
+[@@deriving sexp]
+
+type fragment_assembler
+
+external fragment_assembler_create
+  :  (Bigstringaf.t -> header -> unit)
+  -> fragment_assembler
+  = "ml_aeron_fragment_assembler_create"
+
+external subscription_poll
+  :  subscription
+  -> fragment_assembler
+  -> int
+  -> int
+  = "ml_aeron_subscription_poll"
