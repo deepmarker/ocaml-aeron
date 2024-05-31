@@ -2,6 +2,10 @@ open Core
 open Async
 open Aeron
 
+let src = Logs.Src.create "aeron.main"
+
+module Lo = (val Logs.src_log src : Logs.LOG)
+
 let subscribe timeout prefix chan streamID =
   let ctx = create_context () in
   context_set_dir ctx prefix;
@@ -11,23 +15,23 @@ let subscribe timeout prefix chan streamID =
   Aeron_async.add_subscription client (Uri.of_string chan) (Int32.of_int_exn streamID)
   >>= fun sub ->
   (match subscription_status sub with
-   | 1 -> printf "Subscription OK\n"
+   | 1 -> Lo.info (fun m -> m "Subscription OK")
    | _ -> assert false);
   let consts = subscription_consts sub in
-  Format.printf "%a@." Sexp.pp (sexp_of_subscription_consts consts);
+  Lo.info (fun m -> m "%a" Sexp.pp (sexp_of_subscription_consts consts));
   let terminate = Ivar.create () in
   let cb buf hdr =
-    Format.printf "(%a) %s\n%!" Sexp.pp (sexp_of_header hdr) (Bigstring.to_string buf)
+    Lo.app (fun m -> m "(%a) %s" Sexp.pp (sexp_of_header hdr) (Bigstring.to_string buf))
   in
   don't_wait_for (Aeron_async.poll ~stop:(Ivar.read terminate) sub cb);
   let cleanup =
     Ivar.read terminate
     >>= fun () ->
-    printf "Cleanup up...\n";
     Aeron_async.close_subscription sub
     >>| fun () ->
     close client;
-    close_context ctx
+    close_context ctx;
+    Lo.info (fun m -> m "Cleanup done")
   in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
   cleanup
@@ -89,8 +93,8 @@ let publish timeout prefix chan streamID =
       let msg = Format.kasprintf Bigstring.of_string "Message %i" i in
       let len = Bigstring.length msg in
       (match publication_offer pub msg len with
-       | Ok x -> printf "New offset %d\n" x
-       | Error x -> Format.printf "%a\n%!" Sexp.pp (sexp_of_offer_result x));
+       | Ok x -> Lo.app (fun m -> m "New offset %d" x)
+       | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (sexp_of_offer_result x)));
       Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop (succ i)
   in
   don't_wait_for (loop 0);
@@ -98,11 +102,11 @@ let publish timeout prefix chan streamID =
   let cleanup =
     Ivar.read terminate
     >>= fun () ->
-    printf "Cleanup up...\n";
     Aeron_async.close_publication pub
     >>| fun () ->
     close client;
-    close_context ctx
+    close_context ctx;
+    Lo.info (fun m -> m "Cleanup done")
   in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
   cleanup
@@ -126,7 +130,7 @@ let publish =
            string
            String.sexp_of_t
            ~default:"aeron:udp?endpoint=localhost:40123"
-           ~doc:"URI default channel to subscribe to"
+           ~doc:"URI default channel to publish to"
        and streamID =
          flag_optional_with_default_doc
            "s"
