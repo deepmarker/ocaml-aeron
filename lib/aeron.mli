@@ -1,65 +1,84 @@
-type context
-type t
-type add_publication
-type publication
-type add_subscription
-type subscription
-type fragment_assembler
+module Context : sig
+  type t
 
-val create_context : unit -> context
-val close_context : context -> unit
-val context_set_dir : context -> string -> unit
-val context_set_driver_timeout_ms : context -> int -> unit
-val init : context -> t
+  val create : unit -> t
+  val close : t -> unit
+  val set_dir : t -> string -> unit
+  val set_driver_timeout_ms : t -> int -> unit
+end
+
+type t
+
+val init : Context.t -> t
 val start : t -> unit
 val close : t -> unit
-val add_publication : t -> Uri.t -> int32 -> add_publication
-val add_publication_poll : add_publication -> publication option
-val add_subscription : t -> Uri.t -> int32 -> add_subscription
-val add_subscription_poll : add_subscription -> subscription option
-val close_publication : publication -> unit
-val publication_is_closed : publication -> bool
-val close_subscription : subscription -> unit
-val subscription_is_closed : subscription -> bool
-val subscription_status : subscription -> int
 
-type offer_result =
-  | Not_connected
-  | Back_pressured
-  | Admin_action
-  | Closed
-  | Max_position_exceeded
-[@@deriving sexp]
+module Header : sig
+  type t =
+    { frame : frame
+    ; initial_term_id : int32
+    ; position_bits_to_shift : int
+    }
 
-val publication_offer : publication -> Bigstringaf.t -> int -> (int, offer_result) result
+  and frame =
+    { frame_length : int32
+    ; version : int
+    ; flags : int
+    ; typ : int
+    ; term_offset : int32
+    ; session_id : int32
+    ; stream_id : int32
+    ; term_id : int32
+    }
+  [@@deriving sexp]
+end
 
-type subscription_consts =
-  { channel : string
-  ; registration_id : int64
-  ; stream_id : int32
-  ; channel_status_indicator_id : int32
-  }
-[@@deriving sexp]
+module FragmentAssembler : sig
+  type t
 
-val subscription_consts : subscription -> subscription_consts
+  val create : (Bigstringaf.t -> Header.t -> unit) -> t
+end
 
-type header =
-  { frame : frame
-  ; initial_term_id : int32
-  ; position_bits_to_shift : int
-  }
+module Subscription : sig
+  type conn = t
+  type add
+  type t
 
-and frame =
-  { frame_length : int32
-  ; version : int
-  ; flags : int
-  ; typ : int
-  ; term_offset : int32
-  ; session_id : int32
-  ; stream_id : int32
-  ; term_id : int32
-  }
-[@@deriving sexp]
+  val add : conn -> Uri.t -> int32 -> add
+  val add_poll : add -> t option
+  val close : t -> unit
+  val is_closed : t -> bool
+  val status : t -> int
 
-val fragment_assembler_create : (Bigstringaf.t -> header -> unit) -> fragment_assembler
-val subscription_poll : subscription -> fragment_assembler -> int -> int
+  type consts =
+    { channel : string
+    ; registration_id : int64
+    ; stream_id : int32
+    ; channel_status_indicator_id : int32
+    }
+  [@@deriving sexp]
+
+  val consts : t -> consts
+  val poll : t -> FragmentAssembler.t -> int -> int
+end
+
+module Publication : sig
+  type conn = t
+  type add
+  type t
+
+  val add : conn -> Uri.t -> int32 -> add
+  val add_poll : add -> t option
+  val close : t -> unit
+  val is_closed : t -> bool
+
+  type offer_result =
+    | Not_connected
+    | Back_pressured
+    | Admin_action
+    | Closed
+    | Max_position_exceeded
+  [@@deriving sexp]
+
+  val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> (int, offer_result) result
+end

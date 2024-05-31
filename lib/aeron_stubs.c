@@ -217,9 +217,9 @@ CAMLprim value ml_aeron_publication_is_connected(value pub) {
     return(Val_bool(aeron_publication_is_connected(Publication_val(pub))));
 }
 
-CAMLprim value ml_aeron_publication_offer(value pub, value buf, value len) {
+CAMLprim value ml_aeron_publication_offer(value pub, value buf, value pos, value len) {
     int ret = aeron_publication_offer(Publication_val(pub),
-                                      Caml_ba_data_val(buf),
+                                      Caml_ba_data_val(buf)+Long_val(pos),
                                       Long_val(len), NULL, NULL);
     return(Val_long(ret));
 }

@@ -2,54 +2,58 @@ open Core
 open Async
 open Aeron
 
-let add_publication t uri streamID =
-  let wait = add_publication t uri streamID in
-  let rec loop () =
-    match add_publication_poll wait with
-    | None -> Scheduler.yield () >>= loop
-    | Some x -> return x
-  in
-  loop ()
-;;
+module Publication = struct
+  let add t uri streamID =
+    let wait = Publication.add t uri streamID in
+    let rec loop () =
+      match Publication.add_poll wait with
+      | None -> Scheduler.yield () >>= loop
+      | Some x -> return x
+    in
+    loop ()
+  ;;
 
-let add_subscription t uri streamID =
-  let wait = add_subscription t uri streamID in
-  let rec loop () =
-    match add_subscription_poll wait with
-    | None -> Scheduler.yield () >>= loop
-    | Some x -> return x
-  in
-  loop ()
-;;
+  let close t =
+    Publication.close t;
+    let rec loop () =
+      match Publication.is_closed t with
+      | true -> Deferred.unit
+      | false -> Scheduler.yield () >>= loop
+    in
+    loop ()
+  ;;
+end
 
-let close_publication t =
-  close_publication t;
-  let rec loop () =
-    match publication_is_closed t with
-    | true -> Deferred.unit
-    | false -> Scheduler.yield () >>= loop
-  in
-  loop ()
-;;
+module Subscription = struct
+  let add t uri streamID =
+    let wait = Subscription.add t uri streamID in
+    let rec loop () =
+      match Subscription.add_poll wait with
+      | None -> Scheduler.yield () >>= loop
+      | Some x -> return x
+    in
+    loop ()
+  ;;
 
-let close_subscription t =
-  close_subscription t;
-  let rec loop () =
-    match subscription_is_closed t with
-    | true -> Deferred.unit
-    | false -> Scheduler.yield () >>= loop
-  in
-  loop ()
-;;
+  let close t =
+    Subscription.close t;
+    let rec loop () =
+      match Subscription.is_closed t with
+      | true -> Deferred.unit
+      | false -> Scheduler.yield () >>= loop
+    in
+    loop ()
+  ;;
 
-let poll ?stop t cb =
-  let assembler = fragment_assembler_create cb in
-  let rec loop () =
-    let nb_fragments = subscription_poll t assembler 10 in
-    (* printf "got %d frags\n" nb_fragments; *)
-    match stop with
-    | Some iv when Deferred.is_determined iv -> Deferred.unit
-    | _ -> Clock_ns.after (Time_ns.Span.of_int_ms nb_fragments) >>= loop
-  in
-  loop ()
-;;
+  let poll ?stop t cb =
+    let assembler = FragmentAssembler.create cb in
+    let rec loop () =
+      let nb_fragments = Subscription.poll t assembler 10 in
+      (* printf "got %d frags\n" nb_fragments; *)
+      match stop with
+      | Some iv when Deferred.is_determined iv -> Deferred.unit
+      | _ -> Clock_ns.after (Time_ns.Span.of_int_ms nb_fragments) >>= loop
+    in
+    loop ()
+  ;;
+end
