@@ -4,4 +4,10 @@
  (package aeron_async)
  (preprocess
   (pps ppx_jane))
- (libraries aeron aeron_async core core_unix.command_unix async logs-async-reporter))
+ (libraries
+   aeron
+   aeron_async
+   core
+   core_unix.command_unix
+   async
+   logs-async-reporter))

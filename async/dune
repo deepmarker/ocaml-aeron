@@ -1,3 +1,5 @@
 (library
  (public_name aeron_async)
- (libraries core async aeron))
+ (preprocess
+  (pps ppx_jane))
+ (libraries core async aeron uri-sexp))

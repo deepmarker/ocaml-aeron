@@ -39,6 +39,15 @@ module FragmentAssembler : sig
   val create : (Bigstringaf.t -> Header.t -> unit) -> t
 end
 
+type consts =
+  { channel : string
+  ; registration_id : int64
+  ; stream_id : int32
+  ; session_id : int32
+  ; channel_status_indicator_id : int32
+  }
+[@@deriving sexp]
+
 module Subscription : sig
   type conn = t
   type add
@@ -49,20 +58,22 @@ module Subscription : sig
   val close : t -> unit
   val is_closed : t -> bool
   val status : t -> int
-
-  type consts =
-    { channel : string
-    ; registration_id : int64
-    ; stream_id : int32
-    ; channel_status_indicator_id : int32
-    }
-  [@@deriving sexp]
-
   val consts : t -> consts
   val poll : t -> FragmentAssembler.t -> int -> int
 end
 
-module Publication : sig
+module OfferResult : sig
+  type t =
+    | NewStreamPosition of int
+    | NotConnected
+    | BackPressured
+    | AdminAction
+    | Closed
+    | MaxPositionExceeded
+  [@@deriving sexp]
+end
+
+module type Publication_sig = sig
   type conn = t
   type add
   type t
@@ -71,14 +82,9 @@ module Publication : sig
   val add_poll : add -> t option
   val close : t -> unit
   val is_closed : t -> bool
-
-  type offer_result =
-    | Not_connected
-    | Back_pressured
-    | Admin_action
-    | Closed
-    | Max_position_exceeded
-  [@@deriving sexp]
-
-  val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> (int, offer_result) result
+  val consts : t -> consts
+  val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> OfferResult.t
 end
+
+module Publication : Publication_sig
+module ExclusivePublication : Publication_sig

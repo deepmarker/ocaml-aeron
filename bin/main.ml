@@ -18,7 +18,7 @@ let subscribe timeout prefix chan streamID =
    | 1 -> Lo.info (fun m -> m "Subscription OK")
    | _ -> assert false);
   let consts = Subscription.consts sub in
-  Lo.info (fun m -> m "%a" Sexp.pp (Subscription.sexp_of_consts consts));
+  Lo.info (fun m -> m "%a" Sexp.pp (sexp_of_consts consts));
   let terminate = Ivar.create () in
   let cb buf hdr =
     Lo.app (fun m -> m "(%a) %s" Sexp.pp (Header.sexp_of_t hdr) (Bigstring.to_string buf))
@@ -77,35 +77,30 @@ let subscribe =
          subscribe timeout prefix chan streamID])
 ;;
 
-let publish timeout prefix chan streamID =
-  let ctx = Context.create () in
-  Context.set_dir ctx prefix;
-  Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout);
-  let client = init ctx in
-  start client;
-  Aeron_async.Publication.add client (Uri.of_string chan) (Int32.of_int_exn streamID)
-  >>= fun pub ->
+let publish timeout dir channel stream =
+  let open Aeron_async.Publication in
+  let channel = Uri.of_string channel in
+  let stream = Int32.of_int_exn stream in
+  EZ.create dir ~timeout channel stream
+  >>= fun conn ->
+  let consts = Publication.consts conn.v in
+  Lo.info (fun m -> m "%a" Sexp.pp (sexp_of_consts consts));
   let terminate = Ivar.create () in
   let rec loop i =
     match Ivar.is_full terminate with
     | true -> Deferred.unit
     | false ->
       let msg = Format.kasprintf Bigstring.of_string "Message %i" i in
-      (match Publication.offer pub msg with
-       | Ok x -> Lo.app (fun m -> m "New offset %d" x)
-       | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Publication.sexp_of_offer_result x)));
+      (match EZ.offer conn msg with
+       | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
+       | x -> Lo.err (fun m -> m "%a" Sexp.pp (OfferResult.sexp_of_t x)));
       Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop (succ i)
   in
   don't_wait_for (loop 0);
   (* Cleanup *)
   let cleanup =
     Ivar.read terminate
-    >>= fun () ->
-    Aeron_async.Publication.close pub
-    >>| fun () ->
-    close client;
-    Context.close ctx;
-    Lo.info (fun m -> m "Cleanup done")
+    >>= fun () -> EZ.close conn >>| fun () -> Lo.info (fun m -> m "Cleanup done")
   in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
   cleanup

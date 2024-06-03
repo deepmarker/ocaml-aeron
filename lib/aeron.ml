@@ -49,6 +49,15 @@ module FragmentAssembler = struct
     = "ml_aeron_fragment_assembler_create"
 end
 
+type consts =
+  { channel : string
+  ; registration_id : int64
+  ; stream_id : int32
+  ; session_id : int32
+  ; channel_status_indicator_id : int32
+  }
+[@@deriving sexp]
+
 module Subscription = struct
   type conn = t
   type add
@@ -62,17 +71,45 @@ module Subscription = struct
   external close : t -> unit = "ml_aeron_subscription_close"
   external is_closed : t -> bool = "ml_aeron_subscription_is_closed" [@@noalloc]
   external status : t -> int = "ml_aeron_subscription_channel_status"
-
-  type consts =
-    { channel : string
-    ; registration_id : int64
-    ; stream_id : int32
-    ; channel_status_indicator_id : int32
-    }
-  [@@deriving sexp]
-
   external consts : t -> consts = "ml_aeron_subscription_constants"
   external poll : t -> FragmentAssembler.t -> int -> int = "ml_aeron_subscription_poll"
+end
+
+module OfferResult = struct
+  type t =
+    | NewStreamPosition of int
+    | NotConnected
+    | BackPressured
+    | AdminAction
+    | Closed
+    | MaxPositionExceeded
+  [@@deriving sexp]
+
+  let offer f ?(pos = 0) ?len pub buf =
+    let buflen = Bigstringaf.length buf in
+    let len = Option.value len ~default:buflen in
+    if pos < 0 || len < 0 || pos >= len || len > buflen then invalid_arg "offer";
+    match f pub buf pos len with
+    | -1 -> NotConnected
+    | -2 -> BackPressured
+    | -3 -> AdminAction
+    | -4 -> Closed
+    | -5 -> MaxPositionExceeded
+    | i -> NewStreamPosition i
+  ;;
+end
+
+module type Publication_sig = sig
+  type conn = t
+  type add
+  type t
+
+  val add : conn -> Uri.t -> int32 -> add
+  val add_poll : add -> t option
+  val close : t -> unit
+  val is_closed : t -> bool
+  val consts : t -> consts
+  val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> OfferResult.t
 end
 
 module Publication = struct
@@ -87,24 +124,36 @@ module Publication = struct
 
   external close : t -> unit = "ml_aeron_publication_close"
   external is_closed : t -> bool = "ml_aeron_publication_is_closed" [@@noalloc]
+  external consts : t -> consts = "ml_aeron_publication_constants"
 
   external offer : t -> Bigstringaf.t -> int -> int -> int = "ml_aeron_publication_offer"
   [@@noalloc]
 
-  type offer_result =
-    | Not_connected
-    | Back_pressured
-    | Admin_action
-    | Closed
-    | Max_position_exceeded
-  [@@deriving sexp]
+  let offer = OfferResult.offer offer
+end
 
-  let offer ?(pos = 0) ?len pub buf =
-    let buflen = Bigstringaf.length buf in
-    let len = Option.value len ~default:buflen in
-    if pos < 0 || len < 0 || pos >= len || len > buflen then invalid_arg "offer";
-    match offer pub buf pos len with
-    | i when i < 0 -> Result.error (Obj.magic (-i - 1) : offer_result)
-    | i -> Ok i
-  ;;
+module ExclusivePublication = struct
+  type conn = t
+  type t
+  type add
+
+  external add : conn -> string -> int32 -> add = "ml_aeron_async_add_excl_publication"
+  external add_poll : add -> t option = "ml_aeron_async_add_excl_publication_poll"
+
+  let add client uri stream_id = add client (Uri.to_string uri) stream_id
+
+  external close : t -> unit = "ml_aeron_excl_publication_close"
+  external is_closed : t -> bool = "ml_aeron_excl_publication_is_closed" [@@noalloc]
+  external consts : t -> consts = "ml_aeron_excl_publication_constants"
+
+  external offer
+    :  t
+    -> Bigstringaf.t
+    -> int
+    -> int
+    -> int
+    = "ml_aeron_excl_publication_offer"
+  [@@noalloc]
+
+  let offer = OfferResult.offer offer
 end

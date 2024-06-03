@@ -52,6 +52,27 @@ static struct custom_operations publication_ops = {
   custom_fixed_length_default
 };
 
+static struct custom_operations add_excl_publication_ops = {
+  "aeron.add_exclusive_publication",
+  custom_finalize_default,
+  custom_compare_default,
+  custom_hash_default,
+  custom_serialize_default,
+  custom_deserialize_default,
+  custom_compare_ext_default,
+  custom_fixed_length_default
+};
+
+static struct custom_operations excl_publication_ops = {
+  "aeron.exclusive_publication",
+  custom_finalize_default,
+  custom_compare_default,
+  custom_hash_default,
+  custom_serialize_default,
+  custom_deserialize_default,
+  custom_compare_ext_default,
+  custom_fixed_length_default
+};
 
 static struct custom_operations add_subscription_ops = {
   "aeron.add_subscription",
@@ -90,6 +111,8 @@ static struct custom_operations fragment_assembler_ops = {
 #define Client_val(v) (*((aeron_t **) Data_custom_val(v)))
 #define Add_publication_val(v) (*((aeron_async_add_publication_t **) Data_custom_val(v)))
 #define Publication_val(v) (*((aeron_publication_t **) Data_custom_val(v)))
+#define Add_excl_publication_val(v) (*((aeron_async_add_exclusive_publication_t **) Data_custom_val(v)))
+#define Excl_publication_val(v) (*((aeron_exclusive_publication_t **) Data_custom_val(v)))
 #define Add_subscription_val(v) (*((aeron_async_add_subscription_t **) Data_custom_val(v)))
 #define Subscription_val(v) (*((aeron_subscription_t **) Data_custom_val(v)))
 #define Fragment_assembler_val(v) (*((aeron_fragment_assembler_t **) Data_custom_val(v)))
@@ -181,6 +204,22 @@ CAMLprim value ml_aeron_async_add_publication (value client, value uri, value st
     CAMLreturn(x);
 }
 
+CAMLprim value ml_aeron_async_add_excl_publication (value client, value uri, value stream_id) {
+    CAMLparam3(client, uri, stream_id);
+    CAMLlocal1(x);
+    x = caml_alloc_custom(&add_excl_publication_ops,
+                          sizeof (aeron_async_add_exclusive_publication_t **),
+                          0, 1);
+    int ret = aeron_async_add_exclusive_publication(&Add_excl_publication_val(x),
+                                                    Client_val(client),
+                                                    String_val(uri),
+                                                    Int32_val(stream_id));
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    CAMLreturn(x);
+}
+
 CAMLprim value ml_aeron_async_add_publication_poll (value async) {
     CAMLparam1(async);
     CAMLlocal2(x, res);
@@ -189,6 +228,25 @@ CAMLprim value ml_aeron_async_add_publication_poll (value async) {
                           0, 1);
     int ret = aeron_async_add_publication_poll(&Publication_val(x),
                                                Add_publication_val(async));
+    switch(ret) {
+    case -1:
+        caml_failwith(aeron_errmsg());
+    case 0:
+        CAMLreturn(Val_none);
+    case 1:
+        res = caml_alloc_some(x);
+        CAMLreturn(res);
+    }
+}
+
+CAMLprim value ml_aeron_async_add_excl_publication_poll (value async) {
+    CAMLparam1(async);
+    CAMLlocal2(x, res);
+    x = caml_alloc_custom(&excl_publication_ops,
+                          sizeof (aeron_exclusive_publication_t **),
+                          0, 1);
+    int ret = aeron_async_add_exclusive_publication_poll(&Excl_publication_val(x),
+                                                         Add_excl_publication_val(async));
     switch(ret) {
     case -1:
         caml_failwith(aeron_errmsg());
@@ -209,18 +267,42 @@ CAMLprim value ml_aeron_publication_close(value pub) {
     CAMLreturn(Val_unit);
 }
 
+CAMLprim value ml_aeron_excl_publication_close(value pub) {
+    CAMLparam1(pub);
+    int ret = aeron_exclusive_publication_close(Excl_publication_val(pub), NULL, NULL);
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    CAMLreturn(Val_unit);
+}
+
 CAMLprim value ml_aeron_publication_is_closed(value pub) {
     return(Val_bool(aeron_publication_is_closed(Publication_val(pub))));
+}
+
+CAMLprim value ml_aeron_excl_publication_is_closed(value pub) {
+    return(Val_bool(aeron_exclusive_publication_is_closed(Excl_publication_val(pub))));
 }
 
 CAMLprim value ml_aeron_publication_is_connected(value pub) {
     return(Val_bool(aeron_publication_is_connected(Publication_val(pub))));
 }
 
+CAMLprim value ml_aeron_excl_publication_is_connected(value pub) {
+    return(Val_bool(aeron_exclusive_publication_is_connected(Excl_publication_val(pub))));
+}
+
 CAMLprim value ml_aeron_publication_offer(value pub, value buf, value pos, value len) {
     int ret = aeron_publication_offer(Publication_val(pub),
                                       Caml_ba_data_val(buf)+Long_val(pos),
                                       Long_val(len), NULL, NULL);
+    return(Val_long(ret));
+}
+
+CAMLprim value ml_aeron_excl_publication_offer(value pub, value buf, value pos, value len) {
+    int ret = aeron_exclusive_publication_offer(Excl_publication_val(pub),
+                                                Caml_ba_data_val(buf)+Long_val(pos),
+                                                Long_val(len), NULL, NULL);
     return(Val_long(ret));
 }
 
@@ -285,11 +367,46 @@ CAMLprim value ml_aeron_subscription_constants(value sub) {
     if (ret < 0)
         caml_failwith(aeron_errmsg());
 
-    x = caml_alloc_tuple(4);
+    x = caml_alloc_tuple(5);
     Store_field(x, 0, caml_copy_string(consts.channel));
     Store_field(x, 1, caml_copy_int64(consts.registration_id));
     Store_field(x, 2, caml_copy_int32(consts.stream_id));
-    Store_field(x, 3, caml_copy_int32(consts.channel_status_indicator_id));
+    Store_field(x, 3, caml_copy_int32(-1));
+    Store_field(x, 4, caml_copy_int32(consts.channel_status_indicator_id));
+    CAMLreturn(x);
+}
+
+CAMLprim value ml_aeron_publication_constants(value pub) {
+    CAMLparam1(pub);
+    CAMLlocal1(x);
+    aeron_publication_constants_t consts;
+    int ret = aeron_publication_constants(Publication_val(pub), &consts);
+    if (ret < 0)
+        caml_failwith(aeron_errmsg());
+
+    x = caml_alloc_tuple(5);
+    Store_field(x, 0, caml_copy_string(consts.channel));
+    Store_field(x, 1, caml_copy_int64(consts.registration_id));
+    Store_field(x, 2, caml_copy_int32(consts.stream_id));
+    Store_field(x, 3, caml_copy_int32(consts.session_id));
+    Store_field(x, 4, caml_copy_int32(consts.channel_status_indicator_id));
+    CAMLreturn(x);
+}
+
+CAMLprim value ml_aeron_excl_publication_constants(value pub) {
+    CAMLparam1(pub);
+    CAMLlocal1(x);
+    aeron_publication_constants_t consts;
+    int ret = aeron_exclusive_publication_constants(Excl_publication_val(pub), &consts);
+    if (ret < 0)
+        caml_failwith(aeron_errmsg());
+
+    x = caml_alloc_tuple(5);
+    Store_field(x, 0, caml_copy_string(consts.channel));
+    Store_field(x, 1, caml_copy_int64(consts.registration_id));
+    Store_field(x, 2, caml_copy_int32(consts.stream_id));
+    Store_field(x, 3, caml_copy_int32(consts.session_id));
+    Store_field(x, 4, caml_copy_int32(consts.channel_status_indicator_id));
     CAMLreturn(x);
 }
 
@@ -301,9 +418,9 @@ static value build_caml_header(aeron_header_t *hdr) {
 
     value vs = caml_alloc_tuple(8);
     Store_field(vs, 0, caml_copy_int32(values.frame.frame_length));
-    Store_field(vs, 1, Val_int(values.frame.version));
-    Store_field(vs, 2, Val_int(values.frame.flags));
-    Store_field(vs, 3, Val_int(values.frame.type));
+    Store_field(vs, 1,         Val_int(values.frame.version));
+    Store_field(vs, 2,         Val_int(values.frame.flags));
+    Store_field(vs, 3,         Val_int(values.frame.type));
     Store_field(vs, 4, caml_copy_int32(values.frame.term_offset));
     Store_field(vs, 5, caml_copy_int32(values.frame.session_id));
     Store_field(vs, 6, caml_copy_int32(values.frame.stream_id));
@@ -311,7 +428,7 @@ static value build_caml_header(aeron_header_t *hdr) {
     value x = caml_alloc_tuple(3);
     Store_field(x, 0, vs);
     Store_field(x, 1, caml_copy_int32(values.initial_term_id));
-    Store_field(x, 2, Val_long(values.position_bits_to_shift));
+    Store_field(x, 2,        Val_long(values.position_bits_to_shift));
     return x;
 }
 
