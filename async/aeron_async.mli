@@ -12,6 +12,7 @@ type endpoint =
 
 type 'a t =
   { ctx : Context.t
+  ; chn : Uri.t
   ; client : Aeron.t
   ; v : 'a
   }
@@ -39,9 +40,17 @@ module Subscription : sig
   val close : Subscription.t -> unit Deferred.t
 
   val poll
-    :  ?stop:unit Deferred.t
+    :  ?stop:_ Deferred.t
     -> Subscription.t
     -> (Bigstring.t -> Header.t -> unit)
+    -> unit Deferred.t
+
+  val subscribe_direct
+    :  ?stop:_ Deferred.t
+    -> Aeron.t
+    -> chan:Uri.t
+    -> streamID:int
+    -> (Bigstringaf.t -> Header.t -> unit)
     -> unit Deferred.t
 
   module EZ : sig
@@ -56,7 +65,7 @@ module Subscription : sig
       -> Subscription.t t Deferred.t
 
     val poll
-      :  ?stop:unit Deferred.t
+      :  ?stop:_ Deferred.t
       -> Subscription.t t
       -> (Bigstring.t -> Header.t -> unit)
       -> unit Deferred.t

@@ -33,12 +33,6 @@ module Header : sig
   [@@deriving sexp]
 end
 
-module FragmentAssembler : sig
-  type t
-
-  val create : (Bigstringaf.t -> Header.t -> unit) -> t
-end
-
 type consts =
   { channel : string
   ; registration_id : int64
@@ -47,6 +41,12 @@ type consts =
   ; channel_status_indicator_id : int32
   }
 [@@deriving sexp]
+
+module FragmentAssembler : sig
+  type t
+
+  val free : t -> unit
+end
 
 module Subscription : sig
   type conn = t
@@ -57,9 +57,16 @@ module Subscription : sig
   val add_poll : add -> t option
   val close : t -> unit
   val is_closed : t -> bool
+
+  (** Weirdly returns -1 for IPC transport. Supposed to return 1 on
+      success and -1 on error. *)
   val status : t -> int
+
   val consts : t -> consts
-  val poll : t -> FragmentAssembler.t -> int -> int
+
+  val mk_poll
+    :  (Bigstringaf.t -> Header.t -> unit)
+    -> FragmentAssembler.t * (t -> int -> int)
 end
 
 module OfferResult : sig

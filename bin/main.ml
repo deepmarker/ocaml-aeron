@@ -6,7 +6,12 @@ let src = Logs.Src.create "aeron.main"
 
 module Lo = (val Logs.src_log src : Logs.LOG)
 
-let subscribe timeout prefix chan streamID =
+let cb buf hdr =
+  Lo.app (fun m ->
+    m "(%a) (%d bytes payload)" Sexp.pp (Header.sexp_of_t hdr) (Bigstring.length buf))
+;;
+
+let _subscribe timeout prefix chan streamID =
   let ctx = Context.create () in
   Context.set_dir ctx prefix;
   Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout);
@@ -20,9 +25,6 @@ let subscribe timeout prefix chan streamID =
   let consts = Subscription.consts sub in
   Lo.info (fun m -> m "%a" Sexp.pp (sexp_of_consts consts));
   let terminate = Ivar.create () in
-  let cb buf hdr =
-    Lo.app (fun m -> m "(%a) %s" Sexp.pp (Header.sexp_of_t hdr) (Bigstring.to_string buf))
-  in
   don't_wait_for (Aeron_async.Subscription.poll ~stop:(Ivar.read terminate) sub cb);
   let cleanup =
     Ivar.read terminate
@@ -37,6 +39,26 @@ let subscribe timeout prefix chan streamID =
   cleanup
 ;;
 
+let subscribe_direct timeout prefix chan streamID =
+  let ctx = Context.create () in
+  Context.set_dir ctx prefix;
+  Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout);
+  let client = init ctx in
+  start client;
+  let terminate = Ivar.create () in
+  Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
+  Aeron_async.Subscription.subscribe_direct
+    ~stop:(Ivar.read terminate)
+    client
+    ~chan
+    ~streamID
+    cb
+  >>| fun () ->
+  close client;
+  Context.close ctx;
+  Lo.info (fun m -> m "Cleanup done")
+;;
+
 let subscribe =
   Command.async
     ~summary:"Basic subscriber"
@@ -47,14 +69,14 @@ let subscribe =
            "p"
            string
            String.sexp_of_t
-           ~default:"/dev/shm"
+           ~default:("/dev/shm/aeron-" ^ Sys.getenv_exn "LOGNAME")
            ~doc:"STRING aeron.dir location specified as prefix"
        and chan =
          flag_optional_with_default_doc
            "chan"
            string
-           String.sexp_of_t
-           ~default:"aeron:udp?endpoint=localhost:40123"
+           sexp_of_string
+           ~default:"aeron:ipc"
            ~doc:"URI default channel to subscribe to"
        and streamID =
          flag_optional_with_default_doc
@@ -74,10 +96,11 @@ let subscribe =
        and () = Logs_async_reporter.set_color_via_param () in
        fun () ->
          Logs.set_reporter (Logs_async_reporter.reporter ());
-         subscribe timeout prefix chan streamID])
+         let chan = Uri.of_string chan in
+         subscribe_direct timeout prefix chan streamID])
 ;;
 
-let publish timeout dir channel stream =
+let publish timeout dir channel stream sz =
   let open Aeron_async.Publication in
   let channel = Uri.of_string channel in
   let stream = Int32.of_int_exn stream in
@@ -90,7 +113,7 @@ let publish timeout dir channel stream =
     match Ivar.is_full terminate with
     | true -> Deferred.unit
     | false ->
-      let msg = Format.kasprintf Bigstring.of_string "Message %i" i in
+      let msg = Bigstring.create sz in
       (match EZ.offer conn msg with
        | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
        | x -> Lo.err (fun m -> m "%a" Sexp.pp (OfferResult.sexp_of_t x)));
@@ -116,14 +139,14 @@ let publish =
            "p"
            string
            String.sexp_of_t
-           ~default:"/dev/shm"
+           ~default:("/dev/shm/aeron-" ^ Sys.getenv_exn "LOGNAME")
            ~doc:"STRING aeron.dir location specified as prefix"
        and chan =
          flag_optional_with_default_doc
            "chan"
            string
            String.sexp_of_t
-           ~default:"aeron:udp?endpoint=localhost:40123"
+           ~default:"aeron:ipc"
            ~doc:"URI default channel to publish to"
        and streamID =
          flag_optional_with_default_doc
@@ -139,11 +162,18 @@ let publish =
            Time_ns_unix.Span.sexp_of_t
            ~default:(Time_ns.Span.of_int_sec 10)
            ~doc:"SPAN driver liveliness timeout"
+       and sz =
+         flag_optional_with_default_doc
+           "sz"
+           int
+           sexp_of_int
+           ~default:10
+           ~doc:"INT Size of messages sent"
        and () = Logs_async_reporter.set_level_via_param []
        and () = Logs_async_reporter.set_color_via_param () in
        fun () ->
          Logs.set_reporter (Logs_async_reporter.reporter ());
-         publish timeout prefix chan streamID])
+         publish timeout prefix chan streamID sz])
 ;;
 
 let cmds =

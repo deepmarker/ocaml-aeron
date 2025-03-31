@@ -12,6 +12,7 @@ type endpoint =
 
 type 'a t =
   { ctx : Context.t
+  ; chn : Uri.t
   ; client : Aeron.t
   ; v : 'a
   }
@@ -39,14 +40,14 @@ module MkPublication (P : Publication_sig) = struct
   ;;
 
   module EZ = struct
-    let create ?timeout dir channel stream =
+    let create ?timeout dir chn stream =
       let ctx = Context.create () in
       Context.set_dir ctx dir;
       Option.iter timeout ~f:(fun timeout ->
         Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout));
       let client = init ctx in
       start client;
-      add client channel stream >>| fun pub -> Fields.create ~ctx ~client ~v:pub
+      add client chn stream >>| fun pub -> Fields.create ~ctx ~client ~v:pub ~chn
     ;;
 
     let create_endpoint t = create t.dir ?timeout:t.timeout t.channel t.stream
@@ -101,26 +102,28 @@ module Subscription = struct
   ;;
 
   let poll ?stop t cb =
-    let assembler = FragmentAssembler.create cb in
+    let asm, poll = Subscription.mk_poll cb in
     let rec loop () =
-      let nb_fragments = Subscription.poll t assembler 10 in
+      let nb_fragments = poll t 10 in
       (* printf "got %d frags\n" nb_fragments; *)
       match stop with
-      | Some iv when Deferred.is_determined iv -> Deferred.unit
+      | Some iv when Deferred.is_determined iv ->
+        FragmentAssembler.free asm;
+        Deferred.unit
       | _ -> Clock_ns.after (Time_ns.Span.of_int_ms nb_fragments) >>= loop
     in
     loop ()
   ;;
 
   module EZ = struct
-    let create ?timeout dir channel stream =
+    let create ?timeout dir chn stream =
       let ctx = Context.create () in
       Context.set_dir ctx dir;
       Option.iter timeout ~f:(fun timeout ->
         Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout));
       let client = init ctx in
       start client;
-      add client channel stream >>| fun sub -> Fields.create ~ctx ~client ~v:sub
+      add client chn stream >>| fun sub -> Fields.create ~ctx ~client ~v:sub ~chn
     ;;
 
     let create_endpoint endpoint =
@@ -136,4 +139,10 @@ module Subscription = struct
 
     let poll ?stop t cb = poll ?stop t.v cb
   end
+
+  let subscribe_direct ?stop client ~chan ~streamID f =
+    add client chan (Int32.of_int_exn streamID)
+    >>= fun sub ->
+    Monitor.protect (fun () -> poll ?stop sub f) ~finally:(fun () -> close sub)
+  ;;
 end

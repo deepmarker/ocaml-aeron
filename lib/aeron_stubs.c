@@ -1,7 +1,5 @@
 #include <string.h>
-#include <caml/mlvalues.h>
 #include <caml/alloc.h>
-#include <caml/memory.h>
 #include <caml/custom.h>
 #include <caml/fail.h>
 #include <caml/bigarray.h>
@@ -436,29 +434,39 @@ void poll_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_hea
 {
     value hdr = build_caml_header(header);
     value ba = caml_ba_alloc_dims(CAML_BA_CHAR|CAML_BA_C_LAYOUT, 1, (void *)buffer, length);
-    caml_callback2((value)clientd, ba, hdr);
+    static const value * closure_f = NULL;
+    if (closure_f == NULL) {
+        /* First time around, look up by name */
+        closure_f = caml_named_value("frag_asm_cb");
+    }
+    caml_callback3(*closure_f, Val_long(clientd), ba, hdr);
 }
 
-CAMLprim value ml_aeron_fragment_assembler_create(value cb) {
-    CAMLparam1(cb);
+CAMLprim value ml_aeron_fragment_assembler_create(value sub_id) {
+    CAMLparam1(sub_id);
     CAMLlocal1(x);
     x = caml_alloc_custom(&fragment_assembler_ops,
                           sizeof (aeron_fragment_assembler_t **),
                           0, 1);
     int ret = aeron_fragment_assembler_create(&Fragment_assembler_val(x),
                                               poll_handler,
-                                              (void *)cb);
+                                              (void *)Long_val(sub_id));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
     CAMLreturn(x);
 }
 
-CAMLprim value ml_aeron_subscription_poll(value sub, value fragment_assembler, value limit) {
-    CAMLparam3(sub, fragment_assembler, limit);
+CAMLprim value ml_aeron_fragment_assembler_delete(value fragasm) {
+    return (Long_val(aeron_fragment_assembler_delete(Fragment_assembler_val(fragasm))));
+}
+
+CAMLprim value ml_aeron_subscription_poll(value sub, value assembler, value limit) {
+    CAMLparam3(sub, assembler, limit);
+
     int nb_read = aeron_subscription_poll(Subscription_val(sub),
                                           aeron_fragment_assembler_handler,
-                                          Fragment_assembler_val(fragment_assembler),
+                                          Fragment_assembler_val(assembler),
                                           Long_val(limit));
     if (nb_read < 0)
         caml_failwith(aeron_errmsg());

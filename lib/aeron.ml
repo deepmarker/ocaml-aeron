@@ -1,4 +1,5 @@
 open Sexplib.Std
+open StdLabels
 
 module Context = struct
   type t
@@ -42,11 +43,27 @@ end
 
 module FragmentAssembler = struct
   type t
+  (* Make a global function callable from C that will be called back
+     with a subscription ID. *)
 
-  external create
-    :  (Bigstringaf.t -> Header.t -> unit)
-    -> t
-    = "ml_aeron_fragment_assembler_create"
+  external create : int -> t = "ml_aeron_fragment_assembler_create"
+  external free : t -> unit = "ml_aeron_fragment_assembler_delete" [@@noalloc]
+
+  type cb = Bigstringaf.t -> Header.t -> unit
+
+  let subs = Hashtbl.create 13
+
+  let callback id buf h =
+    let subs = Hashtbl.find_all subs id in
+    List.iter subs ~f:(fun cb -> cb buf h)
+  ;;
+
+  let _ = Callback.register "frag_asm_cb" callback
+
+  let register_cb id (cb : cb) =
+    Hashtbl.add subs id cb;
+    create id
+  ;;
 end
 
 type consts =
@@ -73,6 +90,15 @@ module Subscription = struct
   external status : t -> int = "ml_aeron_subscription_channel_status"
   external consts : t -> consts = "ml_aeron_subscription_constants"
   external poll : t -> FragmentAssembler.t -> int -> int = "ml_aeron_subscription_poll"
+
+  let reg_id = ref 0
+
+  let mk_poll f =
+    let id = !reg_id in
+    incr reg_id;
+    let asm = FragmentAssembler.register_cb id f in
+    asm, fun t timeout -> poll t asm timeout
+  ;;
 end
 
 module OfferResult = struct
