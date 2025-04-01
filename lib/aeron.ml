@@ -58,7 +58,7 @@ module FragmentAssembler = struct
     List.iter subs ~f:(fun cb -> cb buf h)
   ;;
 
-  let _ = Callback.register "frag_asm_cb" callback
+  let _ = Callback.register "aeron_frag_asm_cb" callback
 
   let register_cb id (cb : cb) =
     Hashtbl.add subs id cb;

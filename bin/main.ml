@@ -1,62 +1,22 @@
 open Core
 open Async
-open Aeron
 
 let src = Logs.Src.create "aeron.main"
 
 module Lo = (val Logs.src_log src : Logs.LOG)
 
 let cb buf hdr =
+  let open Aeron in
   Lo.app (fun m ->
     m "(%a) (%d bytes payload)" Sexp.pp (Header.sexp_of_t hdr) (Bigstring.length buf))
 ;;
 
-let _subscribe timeout prefix chan streamID =
-  let ctx = Context.create () in
-  Context.set_dir ctx prefix;
-  Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout);
-  let client = init ctx in
-  start client;
-  Aeron_async.Subscription.add client (Uri.of_string chan) (Int32.of_int_exn streamID)
-  >>= fun sub ->
-  (match Subscription.status sub with
-   | 1 -> Lo.info (fun m -> m "Subscription OK")
-   | _ -> assert false);
-  let consts = Subscription.consts sub in
-  Lo.info (fun m -> m "%a" Sexp.pp (sexp_of_consts consts));
-  let terminate = Ivar.create () in
-  don't_wait_for (Aeron_async.Subscription.poll ~stop:(Ivar.read terminate) sub cb);
-  let cleanup =
-    Ivar.read terminate
-    >>= fun () ->
-    Aeron_async.Subscription.close sub
-    >>| fun () ->
-    close client;
-    Context.close ctx;
-    Lo.info (fun m -> m "Cleanup done")
-  in
-  Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
-  cleanup
-;;
-
 let subscribe_direct timeout prefix chan streamID =
-  let ctx = Context.create () in
-  Context.set_dir ctx prefix;
-  Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout);
-  let client = init ctx in
-  start client;
+  let client = Aeron_async.create ~timeout prefix in
   let terminate = Ivar.create () in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
-  Aeron_async.Subscription.subscribe_direct
-    ~stop:(Ivar.read terminate)
-    client
-    ~chan
-    ~streamID
-    cb
-  >>| fun () ->
-  close client;
-  Context.close ctx;
-  Lo.info (fun m -> m "Cleanup done")
+  Aeron_async.subscribe ~stop:(Ivar.read terminate) client ~chan ~streamID cb
+  >>= fun () -> Aeron_async.close client >>| fun () -> Lo.info (fun m -> m "Cleanup done")
 ;;
 
 let subscribe =
@@ -101,29 +61,31 @@ let subscribe =
 ;;
 
 let publish timeout dir channel stream sz =
-  let open Aeron_async.Publication in
+  let open Aeron_async in
   let channel = Uri.of_string channel in
-  let stream = Int32.of_int_exn stream in
-  EZ.create dir ~timeout channel stream
-  >>= fun conn ->
-  let consts = Publication.consts conn.v in
-  Lo.info (fun m -> m "%a" Sexp.pp (sexp_of_consts consts));
+  let client = Aeron_async.create ~timeout dir in
+  Aeron_async.add_publication_exn client `Exclusive channel stream Fn.id
+  >>= fun pub ->
+  let consts = Publication.consts pub in
+  Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_consts consts));
   let terminate = Ivar.create () in
   let rec loop i =
     match Ivar.is_full terminate with
     | true -> Deferred.unit
     | false ->
       let msg = Bigstring.create sz in
-      (match EZ.offer conn msg with
+      (match Publication.offer pub msg with
        | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
-       | x -> Lo.err (fun m -> m "%a" Sexp.pp (OfferResult.sexp_of_t x)));
+       | x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferResult.sexp_of_t x)));
       Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop (succ i)
   in
   don't_wait_for (loop 0);
   (* Cleanup *)
   let cleanup =
     Ivar.read terminate
-    >>= fun () -> EZ.close conn >>| fun () -> Lo.info (fun m -> m "Cleanup done")
+    >>= fun () ->
+    (* This will cleanup the publication. *)
+    Aeron_async.close client >>| fun () -> Lo.info (fun m -> m "Cleanup done")
   in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
   cleanup

@@ -2,22 +2,6 @@ open Core
 open Async
 open Aeron
 
-type endpoint =
-  { dir : string
-  ; channel : Uri.t
-  ; stream : int32
-  ; timeout : Time_ns.Span.t option
-  }
-[@@deriving fields]
-
-type 'a t =
-  { ctx : Context.t
-  ; chn : Uri.t
-  ; client : Aeron.t
-  ; v : 'a
-  }
-[@@deriving fields]
-
 module MkPublication (P : Publication_sig) = struct
   let add t uri streamID =
     let wait = P.add t uri streamID in
@@ -39,46 +23,49 @@ module MkPublication (P : Publication_sig) = struct
     loop ()
   ;;
 
-  module EZ = struct
-    let create ?timeout dir chn stream =
-      let ctx = Context.create () in
-      Context.set_dir ctx dir;
-      Option.iter timeout ~f:(fun timeout ->
-        Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout));
-      let client = init ctx in
-      start client;
-      add client chn stream >>| fun pub -> Fields.create ~ctx ~client ~v:pub ~chn
-    ;;
-
-    let create_endpoint t = create t.dir ?timeout:t.timeout t.channel t.stream
-
-    let close t =
-      close t.v
-      >>| fun () ->
-      Aeron.close t.client;
-      Aeron.Context.close t.ctx
-    ;;
-
-    let offer ?pos ?len t msg = P.offer ?pos ?len t.v msg
-  end
+  let offer ?pos ?len t msg = P.offer ?pos ?len t msg
+  let consts = P.consts
 end
 
-module type Publication_sig = sig
-  type pub
+module Publication = struct
+  module ConcurrentPublication = MkPublication (Publication)
+  module ExclusivePublication = MkPublication (ExclusivePublication)
 
-  val add : Aeron.t -> Uri.t -> int32 -> pub Deferred.t
-  val close : pub -> unit Deferred.t
+  type pub =
+    | Concurrent of Aeron.Publication.t
+    | Exclusive of Aeron.ExclusivePublication.t
 
-  module EZ : sig
-    val create : ?timeout:Time_ns.Span.t -> string -> Uri.t -> int32 -> pub t Deferred.t
-    val create_endpoint : endpoint -> pub t Deferred.t
-    val close : pub t -> unit Deferred.t
-    val offer : ?pos:int -> ?len:int -> pub t -> Bigstring.t -> OfferResult.t
-  end
+  type 'a t =
+    { pub : pub
+    ; encode : 'a -> Bigstring.t
+    }
+
+  let close { pub; _ } =
+    match pub with
+    | Concurrent x -> ConcurrentPublication.close x
+    | Exclusive x -> ExclusivePublication.close x
+  ;;
+
+  let add_concurrent t uri streamID encode =
+    ConcurrentPublication.add t uri streamID >>| fun x -> { pub = Concurrent x; encode }
+  ;;
+
+  let add_exclusive t uri streamID encode =
+    ExclusivePublication.add t uri streamID >>| fun x -> { pub = Exclusive x; encode }
+  ;;
+
+  let offer ?pos ?len { pub; encode } msg =
+    match pub with
+    | Concurrent x -> ConcurrentPublication.offer ?pos ?len x (encode msg)
+    | Exclusive x -> ExclusivePublication.offer ?pos ?len x (encode msg)
+  ;;
+
+  let consts { pub; _ } =
+    match pub with
+    | Concurrent x -> ConcurrentPublication.consts x
+    | Exclusive x -> ExclusivePublication.consts x
+  ;;
 end
-
-module Publication = MkPublication (Publication)
-module ExclusivePublication = MkPublication (ExclusivePublication)
 
 module Subscription = struct
   let add t uri streamID =
@@ -114,35 +101,80 @@ module Subscription = struct
     in
     loop ()
   ;;
+end
 
-  module EZ = struct
-    let create ?timeout dir chn stream =
-      let ctx = Context.create () in
-      Context.set_dir ctx dir;
-      Option.iter timeout ~f:(fun timeout ->
-        Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout));
-      let client = init ctx in
-      start client;
-      add client chn stream >>| fun sub -> Fields.create ~ctx ~client ~v:sub ~chn
-    ;;
-
-    let create_endpoint endpoint =
-      create ?timeout:endpoint.timeout endpoint.dir endpoint.channel endpoint.stream
-    ;;
-
-    let close t =
-      close t.v
-      >>| fun () ->
-      Aeron.close t.client;
-      Aeron.Context.close t.ctx
-    ;;
-
-    let poll ?stop t cb = poll ?stop t.v cb
+module Endpoint = struct
+  module T = struct
+    type t =
+      { chn : string
+      ; stream : int32
+      }
+    [@@deriving compare, hash, bin_io, sexp, fields]
   end
 
-  let subscribe_direct ?stop client ~chan ~streamID f =
-    add client chan (Int32.of_int_exn streamID)
-    >>= fun sub ->
-    Monitor.protect (fun () -> poll ?stop sub f) ~finally:(fun () -> close sub)
-  ;;
+  include T
+
+  let create chn stream = { chn = Uri.to_string chn; stream = Int32.of_int_exn stream }
+
+  include Comparable.Make (T)
+  include Hashable.Make (T)
 end
+
+type t =
+  { ctx : Context.t
+  ; client : Aeron.t
+  ; pubs : pub Endpoint.Table.t
+  }
+
+and pub = P : 'a Publication.t -> pub [@@deriving fields]
+
+let create ?timeout dir =
+  let ctx = Context.create () in
+  Context.set_dir ctx dir;
+  Option.iter timeout ~f:(fun timeout ->
+    Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout));
+  let client = init ctx in
+  start client;
+  let pubs = Endpoint.Table.create () in
+  Fields.create ~ctx ~client ~pubs
+;;
+
+let close { client; ctx; pubs } =
+  let pubs = Hashtbl.to_alist pubs in
+  Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) -> Publication.close pub)
+  >>| fun () ->
+  Aeron.close client;
+  Aeron.Context.close ctx
+;;
+
+let subscribe ?stop t ~chan ~streamID f =
+  Subscription.add t.client chan (Int32.of_int_exn streamID)
+  >>= fun sub ->
+  Monitor.protect
+    (fun () -> Subscription.poll ?stop sub f)
+    ~finally:(fun () -> Subscription.close sub)
+;;
+
+let add_publication { client; pubs; _ } kind chan streamID encode =
+  let endp = Endpoint.create chan streamID in
+  match Hashtbl.find pubs endp, kind with
+  | None, `Concurrent ->
+    Publication.add_concurrent client chan endp.stream encode
+    >>| fun x ->
+    Hashtbl.set pubs ~key:endp ~data:(P x);
+    `Ok x
+  | None, `Exclusive ->
+    Publication.add_exclusive client chan endp.stream encode
+    >>| fun x ->
+    Hashtbl.set pubs ~key:endp ~data:(P x);
+    `Ok x
+  | Some _, _ -> return `Duplicate
+;;
+
+let add_publication_exn t kind chan streamID encode =
+  add_publication t kind chan streamID encode
+  >>= function
+  | `Ok x -> return x
+  | `Duplicate ->
+    raise_s [%message "duplicate stream" ~chan:(chan : Uri.t) ~id:(streamID : int)]
+;;

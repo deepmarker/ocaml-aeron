@@ -4,6 +4,7 @@
 #include <caml/fail.h>
 #include <caml/bigarray.h>
 #include <caml/callback.h>
+#include <caml/threads.h>
 #include <aeron/aeronc.h>
 
 static struct custom_operations context_ops = {
@@ -245,18 +246,18 @@ CAMLprim value ml_aeron_async_add_excl_publication_poll (value async) {
                           0, 1);
     int ret = aeron_async_add_exclusive_publication_poll(&Excl_publication_val(x),
                                                          Add_excl_publication_val(async));
-    switch(ret) {
+    switch (ret) {
     case -1:
-        caml_failwith(aeron_errmsg());
+      caml_failwith(aeron_errmsg());
     case 0:
-        CAMLreturn(Val_none);
+      CAMLreturn(Val_none);
     case 1:
-        res = caml_alloc_some(x);
-        CAMLreturn(res);
+      res = caml_alloc_some(x);
+      CAMLreturn(res);
     }
 }
 
-CAMLprim value ml_aeron_publication_close(value pub) {
+CAMLprim value ml_aeron_publication_close(value pub, value a) {
     CAMLparam1(pub);
     int ret = aeron_publication_close(Publication_val(pub), NULL, NULL);
     if (ret < 0) {
@@ -265,7 +266,7 @@ CAMLprim value ml_aeron_publication_close(value pub) {
     CAMLreturn(Val_unit);
 }
 
-CAMLprim value ml_aeron_excl_publication_close(value pub) {
+CAMLprim value ml_aeron_excl_publication_close(value pub, value a) {
     CAMLparam1(pub);
     int ret = aeron_exclusive_publication_close(Excl_publication_val(pub), NULL, NULL);
     if (ret < 0) {
@@ -437,7 +438,7 @@ void poll_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_hea
     static const value * closure_f = NULL;
     if (closure_f == NULL) {
         /* First time around, look up by name */
-        closure_f = caml_named_value("frag_asm_cb");
+        closure_f = caml_named_value("aeron_frag_asm_cb");
     }
     caml_callback3(*closure_f, Val_long(clientd), ba, hdr);
 }

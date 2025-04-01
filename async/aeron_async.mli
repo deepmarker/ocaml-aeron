@@ -2,72 +2,39 @@ open Core
 open Async
 open Aeron
 
-type endpoint =
-  { dir : string
-  ; channel : Uri.t
-  ; stream : int32
-  ; timeout : Time_ns.Span.t option
-  }
-[@@deriving fields]
+type t
 
-type 'a t =
-  { ctx : Context.t
-  ; chn : Uri.t
-  ; client : Aeron.t
-  ; v : 'a
-  }
-[@@deriving fields]
+val create : ?timeout:Time_ns.Span.t -> string -> t
+val close : t -> unit Deferred.t
 
-module type Publication_sig = sig
-  type pub
+val subscribe
+  :  ?stop:_ Deferred.t
+  -> t
+  -> chan:Uri.t
+  -> streamID:int
+  -> (Bigstring.t -> Header.t -> unit)
+  -> unit Deferred.t
 
-  val add : Aeron.t -> Uri.t -> int32 -> pub Deferred.t
-  val close : pub -> unit Deferred.t
+module Publication : sig
+  type _ t
 
-  module EZ : sig
-    val create : ?timeout:Time_ns.Span.t -> string -> Uri.t -> int32 -> pub t Deferred.t
-    val create_endpoint : endpoint -> pub t Deferred.t
-    val close : pub t -> unit Deferred.t
-    val offer : ?pos:int -> ?len:int -> pub t -> Bigstring.t -> OfferResult.t
-  end
+  val close : _ t -> unit Deferred.t
+  val offer : ?pos:int -> ?len:int -> 'a t -> 'a -> OfferResult.t
+  val consts : _ t -> consts
 end
 
-module Publication : Publication_sig with type pub := Publication.t
-module ExclusivePublication : Publication_sig with type pub := ExclusivePublication.t
+val add_publication
+  :  t
+  -> [< `Concurrent | `Exclusive ]
+  -> Uri.t
+  -> int
+  -> ('a -> Bigstring.t)
+  -> [> `Duplicate | `Ok of 'a Publication.t ] Deferred.t
 
-module Subscription : sig
-  val add : Aeron.t -> Uri.t -> int32 -> Subscription.t Deferred.t
-  val close : Subscription.t -> unit Deferred.t
-
-  val poll
-    :  ?stop:_ Deferred.t
-    -> Subscription.t
-    -> (Bigstring.t -> Header.t -> unit)
-    -> unit Deferred.t
-
-  val subscribe_direct
-    :  ?stop:_ Deferred.t
-    -> Aeron.t
-    -> chan:Uri.t
-    -> streamID:int
-    -> (Bigstringaf.t -> Header.t -> unit)
-    -> unit Deferred.t
-
-  module EZ : sig
-    val create_endpoint : endpoint -> Subscription.t t Deferred.t
-    val close : Subscription.t t -> unit Deferred.t
-
-    val create
-      :  ?timeout:Time_ns.Span.t
-      -> string
-      -> Uri.t
-      -> int32
-      -> Subscription.t t Deferred.t
-
-    val poll
-      :  ?stop:_ Deferred.t
-      -> Subscription.t t
-      -> (Bigstring.t -> Header.t -> unit)
-      -> unit Deferred.t
-  end
-end
+val add_publication_exn
+  :  t
+  -> [< `Concurrent | `Exclusive ]
+  -> Uri.t
+  -> int
+  -> ('a -> Bigstring.t)
+  -> 'a Publication.t Deferred.t
