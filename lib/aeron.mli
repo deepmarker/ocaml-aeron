@@ -77,6 +77,7 @@ module OfferResult : sig
     | AdminAction
     | Closed
     | MaxPositionExceeded
+    | Error
   [@@deriving sexp]
 end
 

@@ -109,6 +109,7 @@ module OfferResult = struct
     | AdminAction
     | Closed
     | MaxPositionExceeded
+    | Error
   [@@deriving sexp]
 
   let offer f ?(pos = 0) ?len pub buf =
@@ -121,6 +122,7 @@ module OfferResult = struct
     | -3 -> AdminAction
     | -4 -> Closed
     | -5 -> MaxPositionExceeded
+    | -6 -> Error
     | i -> NewStreamPosition i
   ;;
 end
