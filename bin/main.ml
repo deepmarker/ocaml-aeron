@@ -1,22 +1,29 @@
 open Core
 open Async
+open Aeron_async
 
 let src = Logs.Src.create "aeron.main"
 
 module Lo = (val Logs.src_log src : Logs.LOG)
 
-let cb buf hdr =
-  let open Aeron in
-  Lo.app (fun m ->
-    m "(%a) (%d bytes payload)" Sexp.pp (Header.sexp_of_t hdr) (Bigstring.length buf))
+let cb iobuf =
+  (* Iter of iobuf and assert that each byte contains wrapped
+     position. *)
+  let len = Iobuf.length iobuf in
+  for i = 0 to len - 1 do
+    let x = Iobuf.Consume.uint8 iobuf in
+    (* Lo.debug (fun m -> m "%d %d %d" i x (i mod 256)) *)
+    assert (x = i mod 256)
+  done;
+  Lo.app (fun m -> m "(%d bytes payload)" len)
 ;;
 
 let subscribe_direct timeout prefix chan streamID =
-  let client = Aeron_async.create ~timeout prefix in
+  let client = create ~timeout prefix in
   let terminate = Ivar.create () in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
-  Aeron_async.subscribe ~stop:(Ivar.read terminate) client ~chan ~streamID cb
-  >>= fun () -> Aeron_async.close client >>| fun () -> Lo.info (fun m -> m "Cleanup done")
+  subscribe ~stop:(Ivar.read terminate) client chan streamID cb
+  >>= fun _ -> Aeron_async.close client >>| fun () -> Lo.info (fun m -> m "Cleanup done")
 ;;
 
 let subscribe =
@@ -67,13 +74,19 @@ let publish timeout dir channel stream sz =
   Aeron_async.add_publication_exn client `Exclusive channel stream Fn.id
   >>= fun pub ->
   let consts = Publication.consts pub in
-  Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_consts consts));
+  Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
   let terminate = Ivar.create () in
+  let msg = Iobuf.create ~len:sz in
+  for i = 0 to sz - 1 do
+    Iobuf.Fill.int8_trunc msg i
+  done;
+  let msg = Iobuf.read_only msg in
   let rec loop i =
+    (* Make it ready to consume. *)
+    Iobuf.flip_lo msg;
     match Ivar.is_full terminate with
     | true -> Deferred.unit
     | false ->
-      let msg = Bigstring.create sz in
       (match Publication.offer pub msg with
        | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
        | x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferResult.sexp_of_t x)));

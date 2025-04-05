@@ -1,10 +1,11 @@
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
 #include <caml/alloc.h>
+#include <caml/memory.h>
 #include <caml/custom.h>
 #include <caml/fail.h>
 #include <caml/bigarray.h>
-#include <caml/callback.h>
-#include <caml/threads.h>
 #include <aeron/aeronc.h>
 
 static struct custom_operations context_ops = {
@@ -95,33 +96,24 @@ static struct custom_operations subscription_ops = {
   custom_fixed_length_default
 };
 
-static struct custom_operations fragment_assembler_ops = {
-  "aeron.fragment_assembler",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
+struct ml_aeron_sub {
+    aeron_subscription_t* sub;
+    int fd;
 };
 
-#define Context_val(v) (*((aeron_context_t **) Data_custom_val(v)))
-#define Client_val(v) (*((aeron_t **) Data_custom_val(v)))
+#define Context_val(v) (*(aeron_context_t **) Data_custom_val(v))
+#define Client_val(v) (*(aeron_t **) Data_custom_val(v))
 #define Add_publication_val(v) (*((aeron_async_add_publication_t **) Data_custom_val(v)))
 #define Publication_val(v) (*((aeron_publication_t **) Data_custom_val(v)))
 #define Add_excl_publication_val(v) (*((aeron_async_add_exclusive_publication_t **) Data_custom_val(v)))
 #define Excl_publication_val(v) (*((aeron_exclusive_publication_t **) Data_custom_val(v)))
 #define Add_subscription_val(v) (*((aeron_async_add_subscription_t **) Data_custom_val(v)))
-#define Subscription_val(v) (*((aeron_subscription_t **) Data_custom_val(v)))
-#define Fragment_assembler_val(v) (*((aeron_fragment_assembler_t **) Data_custom_val(v)))
+#define Subscription_val(v) (((struct ml_aeron_sub *) Data_custom_val(v)))
 
-CAMLprim value ml_aeron_context_init (value unit) {
+CAMLprim value ml_aeron_context_init(value unit) {
     CAMLparam1(unit);
     CAMLlocal1(x);
-    x = caml_alloc_custom(&context_ops,
-                          sizeof (aeron_context_t **),
-                          0, 1);
+    x = caml_alloc_custom(&context_ops, sizeof(aeron_context_t **), 0, 1);
     int ret = aeron_context_init(&Context_val(x));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
@@ -159,9 +151,7 @@ CAMLprim value ml_aeron_context_set_driver_timeout_ms(value ctx, value ms) {
 CAMLprim value ml_aeron_init (value ctx) {
     CAMLparam1(ctx);
     CAMLlocal1(x);
-    x = caml_alloc_custom(&client_ops,
-                          sizeof (aeron_t **),
-                          0, 1);
+    x = caml_alloc_custom(&client_ops, sizeof(aeron_t **), 0, 1);
     int ret = aeron_init(&Client_val(x), Context_val(ctx));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
@@ -298,6 +288,27 @@ CAMLprim value ml_aeron_publication_offer(value pub, value buf, value pos, value
     return(Val_long(ret));
 }
 
+// Is buf still needed after publication_offer completes or not?
+
+
+/* Based on the code you've shown, let me clarify about memory
+   management in the `ml_aeron_publication_offer` function: */
+
+/* When `aeron_publication_offer` is called, it takes the buffer data,
+   position, and length to publish a message. The function is just
+   passing a pointer to the buffer data (offset by the position) to
+   the C function, which will copy the data to send it over the
+   network. */
+
+/* After `aeron_publication_offer` completes, the original buffer is
+   no longer needed by Aeron itself - the data would have been either
+   copied to internal buffers or transmitted directly. The C function
+   doesn't keep a reference to the original buffer. */
+
+/* So, once the function returns, OCaml's garbage collector can safely
+   collect the buffer if there are no other references to it in your
+   OCaml code. */
+
 CAMLprim value ml_aeron_excl_publication_offer(value pub, value buf, value pos, value len) {
     int ret = aeron_exclusive_publication_offer(Excl_publication_val(pub),
                                                 Caml_ba_data_val(buf)+Long_val(pos),
@@ -322,20 +333,19 @@ CAMLprim value ml_aeron_async_add_subscription (value client, value uri, value s
     CAMLreturn(x);
 }
 
-CAMLprim value ml_aeron_async_add_subscription_poll (value async) {
-    CAMLparam1(async);
+CAMLprim value ml_aeron_async_add_subscription_poll (value async, value fd) {
+    CAMLparam2(async, fd);
     CAMLlocal2(x, res);
-    x = caml_alloc_custom(&subscription_ops,
-                          sizeof (aeron_subscription_t **),
-                          0, 1);
-    int ret = aeron_async_add_subscription_poll(&Subscription_val(x),
+    x = caml_alloc_custom(&subscription_ops, sizeof(struct ml_aeron_sub), 0, 1);
+    Subscription_val(x)->fd = Int_val(fd);
+    int ret = aeron_async_add_subscription_poll(&Subscription_val(x)->sub,
                                                 Add_subscription_val(async));
     switch(ret) {
     case -1:
         caml_failwith(aeron_errmsg());
     case 0:
         CAMLreturn(Val_none);
-    case 1:
+    default:
         res = caml_alloc_some(x);
         CAMLreturn(res);
     }
@@ -343,7 +353,7 @@ CAMLprim value ml_aeron_async_add_subscription_poll (value async) {
 
 CAMLprim value ml_aeron_subscription_close(value sub) {
     CAMLparam1(sub);
-    int ret = aeron_subscription_close(Subscription_val(sub), NULL, NULL);
+    int ret = aeron_subscription_close(Subscription_val(sub)->sub, NULL, NULL);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -351,28 +361,41 @@ CAMLprim value ml_aeron_subscription_close(value sub) {
 }
 
 CAMLprim value ml_aeron_subscription_is_closed(value pub) {
-    return(Val_bool(aeron_subscription_is_closed(Subscription_val(pub))));
+    return(Val_bool(aeron_subscription_is_closed(Subscription_val(pub)->sub)));
 }
 
 CAMLprim value ml_aeron_subscription_channel_status(value pub) {
-    return(Val_long(aeron_subscription_channel_status(Subscription_val(pub))));
+    return(Val_long(aeron_subscription_channel_status(Subscription_val(pub)->sub)));
 }
 
 CAMLprim value ml_aeron_subscription_constants(value sub) {
     CAMLparam1(sub);
     CAMLlocal1(x);
     aeron_subscription_constants_t consts;
-    int ret = aeron_subscription_constants(Subscription_val(sub), &consts);
+    int ret = aeron_subscription_constants(Subscription_val(sub)->sub, &consts);
     if (ret < 0)
         caml_failwith(aeron_errmsg());
 
-    x = caml_alloc_tuple(5);
-    Store_field(x, 0, caml_copy_string(consts.channel));
-    Store_field(x, 1, caml_copy_int64(consts.registration_id));
-    Store_field(x, 2, caml_copy_int32(consts.stream_id));
-    Store_field(x, 3, caml_copy_int32(-1));
-    Store_field(x, 4, caml_copy_int32(consts.channel_status_indicator_id));
+    x = caml_alloc_tuple(3);
+    Store_field(x, 0, caml_copy_int64(consts.registration_id));
+    Store_field(x, 1, caml_copy_int32(consts.stream_id));
+    Store_field(x, 2, caml_copy_int32(consts.channel_status_indicator_id));
     CAMLreturn(x);
+}
+
+void ml_alloc_publication_consts(value x, aeron_publication_constants_t *consts) {
+    Store_field(x, 0, caml_copy_int64(consts->original_registration_id));
+    Store_field(x, 1, caml_copy_int64(consts->registration_id));
+    Store_field(x, 2, caml_copy_int64(consts->max_possible_position));
+    Store_field(x, 3, caml_copy_int64(consts->position_bits_to_shift));
+    Store_field(x, 4, caml_copy_int64(consts->term_buffer_length));
+    Store_field(x, 5, caml_copy_int64(consts->max_message_length));
+    Store_field(x, 6, caml_copy_int64(consts->max_payload_length));
+    Store_field(x, 7, caml_copy_int32(consts->stream_id));
+    Store_field(x, 8, caml_copy_int32(consts->session_id));
+    Store_field(x, 9, caml_copy_int32(consts->initial_term_id));
+    Store_field(x, 10, caml_copy_int32(consts->publication_limit_counter_id));
+    Store_field(x, 11, caml_copy_int32(consts->channel_status_indicator_id));
 }
 
 CAMLprim value ml_aeron_publication_constants(value pub) {
@@ -383,12 +406,8 @@ CAMLprim value ml_aeron_publication_constants(value pub) {
     if (ret < 0)
         caml_failwith(aeron_errmsg());
 
-    x = caml_alloc_tuple(5);
-    Store_field(x, 0, caml_copy_string(consts.channel));
-    Store_field(x, 1, caml_copy_int64(consts.registration_id));
-    Store_field(x, 2, caml_copy_int32(consts.stream_id));
-    Store_field(x, 3, caml_copy_int32(consts.session_id));
-    Store_field(x, 4, caml_copy_int32(consts.channel_status_indicator_id));
+    x = caml_alloc_tuple(12);
+    ml_alloc_publication_consts(x, &consts);
     CAMLreturn(x);
 }
 
@@ -398,79 +417,67 @@ CAMLprim value ml_aeron_excl_publication_constants(value pub) {
     aeron_publication_constants_t consts;
     int ret = aeron_exclusive_publication_constants(Excl_publication_val(pub), &consts);
     if (ret < 0)
-        caml_failwith(aeron_errmsg());
+      caml_failwith(aeron_errmsg());
 
-    x = caml_alloc_tuple(5);
-    Store_field(x, 0, caml_copy_string(consts.channel));
-    Store_field(x, 1, caml_copy_int64(consts.registration_id));
-    Store_field(x, 2, caml_copy_int32(consts.stream_id));
-    Store_field(x, 3, caml_copy_int32(consts.session_id));
-    Store_field(x, 4, caml_copy_int32(consts.channel_status_indicator_id));
+    x = caml_alloc_tuple(12);
+    ml_alloc_publication_consts(x, &consts);
     CAMLreturn(x);
 }
 
-static value build_caml_header(aeron_header_t *hdr) {
+void poll_handler(void *clientd, const uint8_t *buffer, size_t length,
+                  aeron_header_t *header) {
+
     aeron_header_values_t values;
-    int ret = aeron_header_values(hdr, &values);
-    if (ret < 0)
-        return Val_unit;
+    int ret = aeron_header_values(header, &values);
+    // TODO: handle error
 
-    value vs = caml_alloc_tuple(8);
-    Store_field(vs, 0, caml_copy_int32(values.frame.frame_length));
-    Store_field(vs, 1,         Val_int(values.frame.version));
-    Store_field(vs, 2,         Val_int(values.frame.flags));
-    Store_field(vs, 3,         Val_int(values.frame.type));
-    Store_field(vs, 4, caml_copy_int32(values.frame.term_offset));
-    Store_field(vs, 5, caml_copy_int32(values.frame.session_id));
-    Store_field(vs, 6, caml_copy_int32(values.frame.stream_id));
-    Store_field(vs, 7, caml_copy_int32(values.frame.term_id));
-    value x = caml_alloc_tuple(3);
-    Store_field(x, 0, vs);
-    Store_field(x, 1, caml_copy_int32(values.initial_term_id));
-    Store_field(x, 2,        Val_long(values.position_bits_to_shift));
-    return x;
-}
+    struct ml_aeron_sub *sub = clientd;
+    ssize_t bytes_written = 0;
+    size_t total_written = 0;
+    size_t remaining = sizeof(aeron_header_values_t);
 
-void poll_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header)
-{
-    value hdr = build_caml_header(header);
-    value ba = caml_ba_alloc_dims(CAML_BA_CHAR|CAML_BA_C_LAYOUT, 1, (void *)buffer, length);
-    static const value * closure_f = NULL;
-    if (closure_f == NULL) {
-        /* First time around, look up by name */
-        closure_f = caml_named_value("aeron_frag_asm_cb");
+    while (total_written < sizeof(aeron_header_values_t)) {
+        bytes_written = write(sub->fd,
+                              (char *)&values + total_written,
+                              remaining);
+
+        if (bytes_written < 0) {
+            if (errno == EINTR)
+                continue;  // Interrupted by signal, try again
+            // Handle error - could return error code if needed
+            break;
+        }
+
+        total_written += bytes_written;
+        remaining -= bytes_written;
     }
-    caml_callback3(*closure_f, Val_long(clientd), ba, hdr);
-}
 
-CAMLprim value ml_aeron_fragment_assembler_create(value sub_id) {
-    CAMLparam1(sub_id);
-    CAMLlocal1(x);
-    x = caml_alloc_custom(&fragment_assembler_ops,
-                          sizeof (aeron_fragment_assembler_t **),
-                          0, 1);
-    int ret = aeron_fragment_assembler_create(&Fragment_assembler_val(x),
-                                              poll_handler,
-                                              (void *)Long_val(sub_id));
-    if (ret < 0) {
-        caml_failwith(aeron_errmsg());
+    // Complete the code to write all of buffer in sub->fd too. No
+    // code blocks, comments, just the code.
+    total_written = 0;
+    bytes_written = 0;
+    remaining = length;
+    while (total_written < length) {
+        bytes_written = write(sub->fd, buffer, remaining);
+        if (bytes_written < 0) {
+            if (errno == EINTR)
+                continue;  // Interrupted by signal, try again
+            // Handle error - could return error code if needed
+            break;
+        }
+
+        total_written += bytes_written;
+        remaining -= bytes_written;
     }
-    CAMLreturn(x);
 }
 
-CAMLprim value ml_aeron_fragment_assembler_delete(value fragasm) {
-    return (Long_val(aeron_fragment_assembler_delete(Fragment_assembler_val(fragasm))));
-}
-
-CAMLprim value ml_aeron_subscription_poll(value sub, value assembler, value limit) {
-    CAMLparam3(sub, assembler, limit);
-
-    int nb_read = aeron_subscription_poll(Subscription_val(sub),
-                                          aeron_fragment_assembler_handler,
-                                          Fragment_assembler_val(assembler),
+CAMLprim value ml_aeron_subscription_poll(value sub, value limit) {
+    CAMLparam2(sub, limit);
+    int nb_read = aeron_subscription_poll(Subscription_val(sub)->sub,
+                                          poll_handler,
+                                          Subscription_val(sub),
                                           Long_val(limit));
     if (nb_read < 0)
         caml_failwith(aeron_errmsg());
-
     CAMLreturn(Val_int(nb_read));
 }

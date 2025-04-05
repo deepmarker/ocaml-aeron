@@ -17,7 +17,7 @@ module Header : sig
   type t =
     { frame : frame
     ; initial_term_id : int32
-    ; position_bits_to_shift : int
+    ; position_bits_to_shift : int64
     }
 
   and frame =
@@ -31,21 +31,9 @@ module Header : sig
     ; term_id : int32
     }
   [@@deriving sexp]
-end
 
-type consts =
-  { channel : string
-  ; registration_id : int64
-  ; stream_id : int32
-  ; session_id : int32
-  ; channel_status_indicator_id : int32
-  }
-[@@deriving sexp]
-
-module FragmentAssembler : sig
-  type t
-
-  val free : t -> unit
+  val sizeof_values : int
+  val of_cstruct : Cstruct.t -> t
 end
 
 module Subscription : sig
@@ -53,8 +41,15 @@ module Subscription : sig
   type add
   type t
 
+  type consts =
+    { registration_id : int64
+    ; stream_id : int32
+    ; channel_status_indicator_id : int32
+    }
+  [@@deriving sexp]
+
   val add : conn -> Uri.t -> int32 -> add
-  val add_poll : add -> t option
+  val add_poll : add -> Unix.file_descr -> t option
   val close : t -> unit
   val is_closed : t -> bool
 
@@ -63,10 +58,7 @@ module Subscription : sig
   val status : t -> int
 
   val consts : t -> consts
-
-  val mk_poll
-    :  (Bigstringaf.t -> Header.t -> unit)
-    -> FragmentAssembler.t * (t -> int -> int)
+  val poll : t -> int -> int
 end
 
 module OfferResult : sig
@@ -81,6 +73,22 @@ module OfferResult : sig
   [@@deriving sexp]
 end
 
+type pub_consts =
+  { orig_registrsation_id : int64
+  ; registration_id : int64
+  ; max_possible_position : int64
+  ; position_bits_to_shift : int64
+  ; term_buffer_length : int64
+  ; max_message_length : int64
+  ; max_payload_length : int64
+  ; stream_id : int32
+  ; session_id : int32
+  ; initial_term_id : int32
+  ; publication_limit_counter_id : int32
+  ; channel_status_indicator_id : int32
+  }
+[@@deriving sexp]
+
 module type Publication_sig = sig
   type conn = t
   type add
@@ -90,7 +98,7 @@ module type Publication_sig = sig
   val add_poll : add -> t option
   val close : t -> unit
   val is_closed : t -> bool
-  val consts : t -> consts
+  val consts : t -> pub_consts
   val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> OfferResult.t
 end
 

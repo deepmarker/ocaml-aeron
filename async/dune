@@ -2,4 +2,4 @@
  (public_name aeron_async)
  (preprocess
   (pps ppx_jane))
- (libraries core async aeron uri-sexp))
+ (libraries core async aeron uri-sexp logs))

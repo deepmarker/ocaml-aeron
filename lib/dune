@@ -4,5 +4,10 @@
   (language c)
   (names aeron_stubs))
  (c_library_flags (-laeron))
- (preprocess (pps ppx_jane))
- (libraries uri sexplib bigstringaf))
+ (preprocess (pps ppx_sexp_conv ppx_cstruct))
+ (libraries
+   unix
+   uri
+   sexplib
+   bigstringaf
+))
