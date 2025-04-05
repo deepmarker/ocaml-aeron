@@ -15,13 +15,18 @@ module Publication : sig
   val consts : _ t -> pub_consts
 end
 
-val subscribe
+module Subscription : sig
+  type sub
+
+  val create : t -> Uri.t -> int -> sub Deferred.t
+  val close : sub -> unit Deferred.t
+end
+
+val poll_subscription
   :  ?stop:_ Deferred.t
   -> ?wait:Time_ns.Span.t
   -> ?max_fragments:int
-  -> t
-  -> Uri.t
-  -> int
+  -> Subscription.sub
   -> ((read, Iobuf.seek) Iobuf.t -> unit)
   -> unit Deferred.t
 

@@ -144,12 +144,30 @@ let add_publication_exn t kind chan streamID encode =
 ;;
 
 module Subscription = struct
-  type t =
+  type sub =
     { sub : Subscription.t
     ; r : Reader.t
     ; wfd : Fd.t
+    ; buf : Bigstring.t
     }
   [@@deriving fields]
+
+  let create t uri streamID =
+    let wait = Aeron.Subscription.add t.client uri (Int.to_int32_exn streamID) in
+    Unix.pipe (Info.of_string "aeron_subscription_add_pipe")
+    >>= function
+    | `Reader rfd, `Writer wfd ->
+      let wfd_raw = Fd.file_descr_exn wfd in
+      let buf = Bigstring.create 4096 in
+      let rec loop () =
+        match Aeron.Subscription.add_poll wait buf wfd_raw with
+        | None -> Scheduler.yield () >>= loop
+        | Some sub ->
+          let r = Reader.create rfd in
+          return (Fields_of_sub.create ~sub ~r ~wfd ~buf)
+      in
+      loop ()
+  ;;
 
   let close t =
     Subscription.close t.sub;
@@ -164,34 +182,14 @@ module Subscription = struct
   ;;
 end
 
-let add_subscription t uri streamID =
-  let wait = Aeron.Subscription.add t.client uri (Int.to_int32_exn streamID) in
-  Unix.pipe (Info.of_string "aeron_subscription_add_pipe")
-  >>= function
-  | `Reader rfd, `Writer wfd ->
-    let wfd_raw = Fd.file_descr_exn wfd in
-    let rec loop () =
-      match Aeron.Subscription.add_poll wait wfd_raw with
-      | None -> Scheduler.yield () >>= loop
-      | Some sub ->
-        let r = Reader.create rfd in
-        return (Subscription.Fields.create ~sub ~r ~wfd)
-    in
-    loop ()
-;;
-
-let subscribe
+let poll_subscription
       ?(stop = Deferred.never ())
       ?(wait = Time_ns.Span.of_int_us 10)
       ?(max_fragments = 10)
-      t
-      uri
-      streamID
+      (sub : Subscription.sub)
       f
   =
   (* Repeatedly [max_fragments] till [stop] is determined. *)
-  add_subscription t uri streamID
-  >>= fun sub ->
   don't_wait_for
     (let rec loop () =
        let _nb_fragments = Aeron.Subscription.poll sub.sub max_fragments in
@@ -206,51 +204,40 @@ let subscribe
      in
      loop ());
   let bbuf = Bigbuffer.create 4096 in
-  let buf = Bigstring.create 4096 in
-  let hdr = Bigsubstring.create ~len:Header.sizeof_values buf in
+  let hdr = Bigstring.create Header.sizeof_values in
+  let shdr = Bigsubstring.create hdr in
   let rec loop () =
     (* read hdr *)
-    Reader.really_read_bigsubstring sub.r hdr
+    Reader.really_read_bigsubstring sub.r shdr
     >>= function
     | `Eof _ ->
       (* TODO: ok? *)
       Deferred.unit
     | `Ok ->
-      let h = Header.of_cstruct (Cstruct.of_bigarray buf) in
+      let h = Header.of_cstruct (Cstruct.of_bigarray hdr) in
       let len = Int32.to_int_exn h.frame.frame_length - 32 in
       (* now read len bytes of payload *)
-      Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
-      >>= (function
-       | `Eof _ ->
-         (* TODO: ok? *)
-         Deferred.unit
-       | `Ok ->
-         (* assemble frame *)
-         (* Lo.debug (fun m -> *)
-         (*   m *)
-         (*     "<- (h bytes %ld) %d bytes (%d)" *)
-         (*     h.frame.frame_length *)
-         (*     len *)
-         (*     (h.frame.flags lsr 6)); *)
-         (match h.frame.flags lsr 6 with
-          | 3 ->
-            (* unique frame *)
-            f (Iobuf.of_bigstring buf ~len);
-            loop ()
-          | 2 ->
-            (* first frame *)
-            Bigbuffer.clear bbuf;
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            loop ()
-          | 0 ->
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            loop ()
-          | _ ->
-            (* last frame *)
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            let len = Bigbuffer.length bbuf in
-            f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
-            loop ()))
+      Lo.debug (fun m -> m "Read %d bytes from sub" len);
+      Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray sub.buf ~len));
+      (match h.frame.flags lsr 6 with
+       | 3 ->
+         (* unique frame *)
+         f (Iobuf.of_bigstring sub.buf ~len);
+         loop ()
+       | 2 ->
+         (* first frame *)
+         Bigbuffer.clear bbuf;
+         Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~len);
+         loop ()
+       | 0 ->
+         Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~len);
+         loop ()
+       | _ ->
+         (* last frame *)
+         Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~len);
+         let len = Bigbuffer.length bbuf in
+         f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
+         loop ())
   in
   loop ()
 ;;

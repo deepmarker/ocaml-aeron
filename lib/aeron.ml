@@ -90,6 +90,7 @@ module Subscription = struct
 
   external add_poll
     :  add
+    -> Bigstringaf.t
     -> Unix.file_descr
     -> t option
     = "ml_aeron_async_add_subscription_poll"

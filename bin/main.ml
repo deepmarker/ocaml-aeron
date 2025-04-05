@@ -12,7 +12,7 @@ let cb iobuf =
   let len = Iobuf.length iobuf in
   for i = 0 to len - 1 do
     let x = Iobuf.Consume.uint8 iobuf in
-    (* Lo.debug (fun m -> m "%d %d %d" i x (i mod 256)) *)
+    Lo.debug (fun m -> m "%d %d %d" i x (i mod 256));
     assert (x = i mod 256)
   done;
   Lo.app (fun m -> m "(%d bytes payload)" len)
@@ -22,8 +22,14 @@ let subscribe_direct timeout prefix chan streamID =
   let client = create ~timeout prefix in
   let terminate = Ivar.create () in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
-  subscribe ~stop:(Ivar.read terminate) client chan streamID cb
-  >>= fun _ -> Aeron_async.close client >>| fun () -> Lo.info (fun m -> m "Cleanup done")
+  Subscription.create client chan streamID
+  >>= fun sub ->
+  Monitor.protect
+    (fun () -> poll_subscription ~stop:(Ivar.read terminate) sub cb)
+    ~finally:(fun () ->
+      Subscription.close sub
+      >>= fun () ->
+      Aeron_async.close client >>| fun () -> Lo.info (fun m -> m "Cleanup done"))
 ;;
 
 let subscribe =
