@@ -99,7 +99,6 @@ static struct custom_operations subscription_ops = {
 struct ml_aeron_sub {
     aeron_subscription_t* sub;
     int fd;
-    char* buf;
 };
 
 #define Context_val(v) (*(aeron_context_t **) Data_custom_val(v))
@@ -334,11 +333,10 @@ CAMLprim value ml_aeron_async_add_subscription (value client, value uri, value s
     CAMLreturn(x);
 }
 
-CAMLprim value ml_aeron_async_add_subscription_poll (value async, value buf, value fd) {
-    CAMLparam3(async, buf, fd);
+CAMLprim value ml_aeron_async_add_subscription_poll (value async, value fd) {
+    CAMLparam2(async, fd);
     CAMLlocal2(x, res);
     x = caml_alloc_custom(&subscription_ops, sizeof(struct ml_aeron_sub), 0, 1);
-    Subscription_val(x)->buf = Caml_ba_data_val(buf);
     Subscription_val(x)->fd = Int_val(fd);
     int ret = aeron_async_add_subscription_poll(&Subscription_val(x)->sub,
                                                 Add_subscription_val(async));
@@ -434,7 +432,6 @@ void poll_handler(void *clientd, const uint8_t *buffer, size_t length,
     // TODO: handle error
 
     struct ml_aeron_sub *sub = clientd;
-    memcpy(sub->buf, buffer, length);
     ssize_t bytes_written = 0;
     size_t total_written = 0;
     size_t remaining = sizeof(aeron_header_values_t);
@@ -444,6 +441,21 @@ void poll_handler(void *clientd, const uint8_t *buffer, size_t length,
                               (char *)&values + total_written,
                               remaining);
 
+        if (bytes_written < 0) {
+            if (errno == EINTR)
+                continue;  // Interrupted by signal, try again
+            // Handle error - could return error code if needed
+            break;
+        }
+
+        total_written += bytes_written;
+        remaining -= bytes_written;
+    }
+    total_written = 0;
+    bytes_written = 0;
+    remaining = length;
+    while (total_written < length) {
+        bytes_written = write(sub->fd, buffer, remaining);
         if (bytes_written < 0) {
             if (errno == EINTR)
                 continue;  // Interrupted by signal, try again

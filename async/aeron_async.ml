@@ -148,7 +148,6 @@ module Subscription = struct
     { sub : Subscription.t
     ; r : Reader.t
     ; wfd : Fd.t
-    ; buf : Bigstring.t
     }
   [@@deriving fields]
 
@@ -158,13 +157,12 @@ module Subscription = struct
     >>= function
     | `Reader rfd, `Writer wfd ->
       let wfd_raw = Fd.file_descr_exn wfd in
-      let buf = Bigstring.create 4096 in
       let rec loop () =
-        match Aeron.Subscription.add_poll wait buf wfd_raw with
+        match Aeron.Subscription.add_poll wait wfd_raw with
         | None -> Scheduler.yield () >>= loop
         | Some sub ->
           let r = Reader.create rfd in
-          return (Fields_of_sub.create ~sub ~r ~wfd ~buf)
+          return (Fields_of_sub.create ~sub ~r ~wfd)
       in
       loop ()
   ;;
@@ -206,6 +204,7 @@ let poll_subscription
   let bbuf = Bigbuffer.create 4096 in
   let hdr = Bigstring.create Header.sizeof_values in
   let shdr = Bigsubstring.create hdr in
+  let buf = Bigstring.create 4096 in
   let rec loop () =
     (* read hdr *)
     Reader.really_read_bigsubstring sub.r shdr
@@ -218,26 +217,32 @@ let poll_subscription
       let len = Int32.to_int_exn h.frame.frame_length - 32 in
       (* now read len bytes of payload *)
       Lo.debug (fun m -> m "Read %d bytes from sub" len);
-      Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray sub.buf ~len));
-      (match h.frame.flags lsr 6 with
-       | 3 ->
-         (* unique frame *)
-         f (Iobuf.of_bigstring sub.buf ~len);
-         loop ()
-       | 2 ->
-         (* first frame *)
-         Bigbuffer.clear bbuf;
-         Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~len);
-         loop ()
-       | 0 ->
-         Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~len);
-         loop ()
-       | _ ->
-         (* last frame *)
-         Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~len);
-         let len = Bigbuffer.length bbuf in
-         f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
-         loop ())
+      Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
+      >>= (function
+       | `Eof _ ->
+         (* TODO: ok? *)
+         Deferred.unit
+       | `Ok ->
+         (* Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray buf ~len)); *)
+         (match h.frame.flags lsr 6 with
+          | 3 ->
+            (* unique frame *)
+            f (Iobuf.of_bigstring buf ~len);
+            loop ()
+          | 2 ->
+            (* first frame *)
+            Bigbuffer.clear bbuf;
+            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            loop ()
+          | 0 ->
+            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            loop ()
+          | _ ->
+            (* last frame *)
+            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            let len = Bigbuffer.length bbuf in
+            f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
+            loop ()))
   in
   loop ()
 ;;

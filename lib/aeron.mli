@@ -49,7 +49,7 @@ module Subscription : sig
   [@@deriving sexp]
 
   val add : conn -> Uri.t -> int32 -> add
-  val add_poll : add -> Bigstringaf.t -> Unix.file_descr -> t option
+  val add_poll : add -> Unix.file_descr -> t option
   val close : t -> unit
   val is_closed : t -> bool
 

@@ -12,7 +12,7 @@ let cb iobuf =
   let len = Iobuf.length iobuf in
   for i = 0 to len - 1 do
     let x = Iobuf.Consume.uint8 iobuf in
-    Lo.debug (fun m -> m "%d %d %d" i x (i mod 256));
+    (* Lo.debug (fun m -> m "%d %d %d" i x (i mod 256)); *)
     assert (x = i mod 256)
   done;
   Lo.app (fun m -> m "(%d bytes payload)" len)
