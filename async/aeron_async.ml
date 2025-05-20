@@ -188,17 +188,22 @@ let poll_subscription
       f
   =
   (* Repeatedly [max_fragments] till [stop] is determined. *)
+  let close_sub =
+    lazy
+      (Lo.debug (fun m -> m "Closing subscription");
+       Subscription.close sub
+       >>= fun () ->
+       Lo.debug (fun m -> m "Closed subscription");
+       Reader.close sub.r)
+  in
   don't_wait_for
     (let rec loop () =
-       let _nb_fragments = Aeron.Subscription.poll sub.sub max_fragments in
-       if Deferred.is_determined stop
-       then (
-         Lo.debug (fun m -> m "Closing subscription");
-         Subscription.close sub
-         >>= fun () ->
-         Lo.debug (fun m -> m "Closed subscription");
-         Reader.close sub.r)
-       else Clock_ns.after wait >>= loop
+       match Aeron.Subscription.poll_exn sub.sub max_fragments with
+       | exception exn ->
+         Lo.err (fun m -> m "%s" (Exn.to_string exn));
+         Lazy.force close_sub
+       | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
+       | _ -> Clock_ns.after wait >>= loop
      in
      loop ());
   let bbuf = Bigbuffer.create 4096 in

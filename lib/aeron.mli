@@ -58,7 +58,7 @@ module Subscription : sig
   val status : t -> int
 
   val consts : t -> consts
-  val poll : t -> int -> int
+  val poll_exn : t -> int -> int
 end
 
 module OfferResult : sig

@@ -100,7 +100,7 @@ module Subscription = struct
   external is_closed : t -> bool = "ml_aeron_subscription_is_closed" [@@noalloc]
   external status : t -> int = "ml_aeron_subscription_channel_status"
   external consts : t -> consts = "ml_aeron_subscription_constants"
-  external poll : t -> int -> int = "ml_aeron_subscription_poll"
+  external poll_exn : t -> int -> int = "ml_aeron_subscription_poll"
 end
 
 module OfferResult = struct
