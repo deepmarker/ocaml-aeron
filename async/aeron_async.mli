@@ -4,8 +4,14 @@ open Aeron
 
 type t
 
-val create : ?timeout:Time_ns.Span.t -> string -> t
-val close : t -> unit Deferred.t
+include Persistent_connection_kernel.Closable with type t := t
+
+val create
+  :  ?driver_timeout:Time_ns.Span.t
+  -> ?idle:Time_ns.Span.t
+  -> on_error:(Err.t -> string -> unit)
+  -> string
+  -> t Deferred.Or_error.t
 
 module Publication : sig
   type _ t
@@ -20,15 +26,15 @@ module Subscription : sig
 
   val create : t -> Uri.t -> int -> sub Deferred.t
   val close : sub -> unit Deferred.t
-end
 
-val poll_subscription
-  :  ?stop:_ Deferred.t
-  -> ?wait:Time_ns.Span.t
-  -> ?max_fragments:int
-  -> Subscription.sub
-  -> ((read, Iobuf.seek) Iobuf.t -> unit)
-  -> unit Deferred.t
+  val start_polling_loop
+    :  ?stop:_ Deferred.t
+    -> ?wait:Time_ns.Span.t
+    -> ?max_fragments:int
+    -> sub
+    -> ((read, Iobuf.seek) Iobuf.t -> unit)
+    -> unit Deferred.t
+end
 
 val add_publication
   :  t

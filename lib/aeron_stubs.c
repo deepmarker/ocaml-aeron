@@ -1,3 +1,4 @@
+#include <endian.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -96,11 +97,6 @@ static struct custom_operations subscription_ops = {
   custom_fixed_length_default
 };
 
-struct ml_aeron_sub {
-    aeron_subscription_t* sub;
-    int fd;
-};
-
 #define Context_val(v) (*(aeron_context_t **) Data_custom_val(v))
 #define Client_val(v) (*(aeron_t **) Data_custom_val(v))
 #define Add_publication_val(v) (*((aeron_async_add_publication_t **) Data_custom_val(v)))
@@ -108,13 +104,54 @@ struct ml_aeron_sub {
 #define Add_excl_publication_val(v) (*((aeron_async_add_exclusive_publication_t **) Data_custom_val(v)))
 #define Excl_publication_val(v) (*((aeron_exclusive_publication_t **) Data_custom_val(v)))
 #define Add_subscription_val(v) (*((aeron_async_add_subscription_t **) Data_custom_val(v)))
-#define Subscription_val(v) (((struct ml_aeron_sub *) Data_custom_val(v)))
 
-CAMLprim value ml_aeron_context_init(value unit) {
-    CAMLparam1(unit);
+// Helper function to ensure all bytes are written
+static ssize_t write_all(int fd, const void *buffer, size_t length) {
+    const char *ptr = (const char *)buffer;
+    size_t remaining = length;
+    ssize_t written;
+
+    while (remaining > 0) {
+        written = write(fd, ptr, remaining);
+        if (written <= 0) {
+            if (errno == EINTR)
+                continue;  // Interrupted by signal, try again
+            return -1;     // Real error
+        }
+
+        ptr += written;
+        remaining -= written;
+    }
+
+    return length;
+}
+
+static void forward_errors(void *clientd, int errcode, const char *message) {
+    // How do I read a be 16 bits integer from clientd?
+    int fd = be16toh(*(uint16_t *)clientd);
+    size_t message_len = strlen(message);
+    if (message_len > UINT16_MAX) {
+        message_len = UINT16_MAX;  // Limit message length
+    }
+
+    uint32_t be_errcode = htobe32(errcode);
+    uint32_t be_message_len = htobe32(message_len);
+
+    // Write all parts with error checking
+    write_all(fd, &be_errcode, sizeof(be_errcode));
+    write_all(fd, &be_message_len, sizeof(be_message_len));
+    write_all(fd, message, message_len);
+}
+
+CAMLprim value ml_aeron_context_init(value ba) {
+    CAMLparam1(ba);
     CAMLlocal1(x);
     x = caml_alloc_custom(&context_ops, sizeof(aeron_context_t **), 0, 1);
     int ret = aeron_context_init(&Context_val(x));
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    ret = aeron_context_set_error_handler(Context_val(x), forward_errors, Caml_ba_data_val(ba));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -148,6 +185,25 @@ CAMLprim value ml_aeron_context_set_driver_timeout_ms(value ctx, value ms) {
     CAMLreturn(Val_unit);
 }
 
+CAMLprim value ml_aeron_context_get_driver_timeout_ms(value ctx) {
+    uint64_t ret = aeron_context_get_driver_timeout_ms(Context_val(ctx));
+    return Val_long(ret);
+}
+
+CAMLprim value ml_aeron_context_set_use_conductor_agent_invoker(value ctx, value x) {
+    CAMLparam2(ctx, x);
+    int ret = aeron_context_set_use_conductor_agent_invoker(Context_val(ctx), Bool_val(x));
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    CAMLreturn(Val_unit);
+}
+
+CAMLprim value ml_aeron_context_get_use_conductor_agent_invoker(value ctx) {
+    bool ret = aeron_context_get_use_conductor_agent_invoker(Context_val(ctx));
+    return Val_bool(ret);
+}
+
 CAMLprim value ml_aeron_init (value ctx) {
     CAMLparam1(ctx);
     CAMLlocal1(x);
@@ -166,6 +222,21 @@ CAMLprim value ml_aeron_start (value client) {
         caml_failwith(aeron_errmsg());
     }
     CAMLreturn(Val_unit);
+}
+
+CAMLprim value ml_aeron_main_do_work(value client) {
+    return Val_int(aeron_main_do_work(Client_val(client)));
+}
+
+CAMLprim value ml_aeron_errmsg(value unit) {
+  CAMLparam1(unit);
+  CAMLlocal1(msg);
+  msg = caml_copy_string(aeron_errmsg());
+  CAMLreturn(msg);
+}
+
+CAMLprim value ml_aeron_errcode(value unit) {
+    return Val_long(aeron_errcode());
 }
 
 CAMLprim value ml_aeron_close (value client) {
@@ -333,46 +404,43 @@ CAMLprim value ml_aeron_async_add_subscription (value client, value uri, value s
     CAMLreturn(x);
 }
 
-CAMLprim value ml_aeron_async_add_subscription_poll (value async, value fd) {
-    CAMLparam2(async, fd);
-    CAMLlocal2(x, res);
-    x = caml_alloc_custom(&subscription_ops, sizeof(struct ml_aeron_sub), 0, 1);
-    Subscription_val(x)->fd = Int_val(fd);
-    int ret = aeron_async_add_subscription_poll(&Subscription_val(x)->sub,
-                                                Add_subscription_val(async));
-    switch(ret) {
-    case -1:
-        caml_failwith(aeron_errmsg());
-    case 0:
-        CAMLreturn(Val_none);
-    default:
-        res = caml_alloc_some(x);
-        CAMLreturn(res);
-    }
+struct ml_aeron_sub {
+    int fd;
+    aeron_subscription_t *sub;
+};
+
+CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    int ret = aeron_async_add_subscription_poll(&sub->sub, Add_subscription_val(async));
+    return Val_int(ret);
 }
 
-CAMLprim value ml_aeron_subscription_close(value sub) {
-    CAMLparam1(sub);
-    int ret = aeron_subscription_close(Subscription_val(sub)->sub, NULL, NULL);
+CAMLprim value ml_aeron_subscription_close(value ba) {
+    CAMLparam1(ba);
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    int ret = aeron_subscription_close(sub->sub, NULL, NULL);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
     CAMLreturn(Val_unit);
 }
 
-CAMLprim value ml_aeron_subscription_is_closed(value pub) {
-    return(Val_bool(aeron_subscription_is_closed(Subscription_val(pub)->sub)));
+CAMLprim value ml_aeron_subscription_is_closed(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return(Val_bool(aeron_subscription_is_closed(sub->sub)));
 }
 
-CAMLprim value ml_aeron_subscription_channel_status(value pub) {
-    return(Val_long(aeron_subscription_channel_status(Subscription_val(pub)->sub)));
+CAMLprim value ml_aeron_subscription_channel_status(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return(Val_long(aeron_subscription_channel_status(sub->sub)));
 }
 
-CAMLprim value ml_aeron_subscription_constants(value sub) {
-    CAMLparam1(sub);
+CAMLprim value ml_aeron_subscription_constants(value ba) {
+    CAMLparam1(ba);
     CAMLlocal1(x);
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     aeron_subscription_constants_t consts;
-    int ret = aeron_subscription_constants(Subscription_val(sub)->sub, &consts);
+    int ret = aeron_subscription_constants(sub->sub, &consts);
     if (ret < 0)
         caml_failwith(aeron_errmsg());
 
@@ -424,55 +492,38 @@ CAMLprim value ml_aeron_excl_publication_constants(value pub) {
     CAMLreturn(x);
 }
 
-void poll_handler(void *clientd, const uint8_t *buffer, size_t length,
-                  aeron_header_t *header) {
+void poll_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header) {
+    if (clientd == NULL) {
+        return; // No client data, cannot continue
+    }
+    struct ml_aeron_sub *sub = clientd;
 
     aeron_header_values_t values;
     int ret = aeron_header_values(header, &values);
-    // TODO: handle error
-
-    struct ml_aeron_sub *sub = clientd;
-    ssize_t bytes_written = 0;
-    size_t total_written = 0;
-    size_t remaining = sizeof(aeron_header_values_t);
-
-    while (total_written < sizeof(aeron_header_values_t)) {
-        bytes_written = write(sub->fd,
-                              (char *)&values + total_written,
-                              remaining);
-
-        if (bytes_written < 0) {
-            if (errno == EINTR)
-                continue;  // Interrupted by signal, try again
-            // Handle error - could return error code if needed
-            break;
-        }
-
-        total_written += bytes_written;
-        remaining -= bytes_written;
+    if (ret < 0) {
+        // Handle error - log or report it
+        return;
     }
-    total_written = 0;
-    bytes_written = 0;
-    remaining = length;
-    while (total_written < length) {
-        bytes_written = write(sub->fd, buffer, remaining);
-        if (bytes_written < 0) {
-            if (errno == EINTR)
-                continue;  // Interrupted by signal, try again
-            // Handle error - could return error code if needed
-            break;
-        }
 
-        total_written += bytes_written;
-        remaining -= bytes_written;
+    // Write header values
+    if (write_all(sub->fd, &values, sizeof(aeron_header_values_t)) != sizeof(aeron_header_values_t)) {
+        // Handle error
+        return;
+    }
+
+    // Write buffer content
+    if (write_all(sub->fd, buffer, length) != length) {
+        // Handle error
+        return;
     }
 }
 
-CAMLprim value ml_aeron_subscription_poll(value sub, value limit) {
-    CAMLparam2(sub, limit);
-    int nb_read = aeron_subscription_poll(Subscription_val(sub)->sub,
+CAMLprim value ml_aeron_subscription_poll(value ba, value limit) {
+    CAMLparam2(ba, limit);
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    int nb_read = aeron_subscription_poll(sub->sub,
                                           poll_handler,
-                                          Subscription_val(sub),
+                                          sub,
                                           Long_val(limit));
     if (nb_read < 0)
         caml_failwith(aeron_errmsg());

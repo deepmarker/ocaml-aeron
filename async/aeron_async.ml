@@ -94,30 +94,96 @@ end
 
 type t =
   { ctx : Context.t
+  ; ba : Bigstring.t
+    (* useless here but must not be GCed, contains fd information for
+       C -> OCaml errors. *)
   ; client : Aeron.t
   ; pubs : pub Endpoint.Table.t
+  ; stop : unit Ivar.t
+  ; subs : Reader.t Uuid.Table.t
   }
 
 and pub = P : 'a Publication.t -> pub [@@deriving fields]
 
-let create ?timeout dir =
-  let ctx = Context.create () in
-  Context.set_dir ctx dir;
-  Option.iter timeout ~f:(fun timeout ->
-    Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms timeout));
-  let client = init ctx in
-  start client;
-  let pubs = Endpoint.Table.create () in
-  Fields.create ~ctx ~client ~pubs
-;;
-
-let close { client; ctx; pubs } =
+let close { client; ctx; pubs; stop; subs; _ } =
+  Lo.debug (fun m -> m "start closing aeron client");
   let pubs = Hashtbl.to_alist pubs in
+  let subs = Hashtbl.to_alist subs in
+  Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, r) -> Reader.close r)
+  >>= fun () ->
   Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) -> Publication.close pub)
   >>| fun () ->
+  (* stop polling *)
+  Lo.debug (fun m -> m "closing aeron client: fill ivar and call close");
   Aeron.close client;
-  Aeron.Context.close ctx
+  Aeron.Context.close ctx;
+  (* Signaling the start of closing? This will trigger a reconnect
+     when using persistent connection. *)
+  Ivar.fill_if_empty stop ()
 ;;
+
+let start_polling t on_error span =
+  let stop = Ivar.read t.stop in
+  Clock_ns.run_at_intervals ~stop ~continue_on_error:true span (fun () ->
+    match main_do_work t.client with
+    | -1 ->
+      (* Synchronous errors *)
+      on_error (errcode ()) (errmsg ());
+      (* TODO: close only if its fatal. Are all errors fatal? *)
+      don't_wait_for (close t)
+    | _ -> ())
+;;
+
+let process_reader t on_error r =
+  let hdr = Bigstring.create 8 in
+  let hdrs = Bigsubstring.create hdr in
+  let rec loop () =
+    Reader.really_read_bigsubstring r hdrs
+    >>= function
+    | `Eof _ -> Deferred.unit
+    | `Ok ->
+      let errcode = Bigstring.get_int32_be hdr ~pos:0 |> Err.of_int in
+      let len = Bigstring.get_int32_be hdr ~pos:4 in
+      let bytes = Bytes.create len in
+      let strs = Substring.create bytes in
+      Reader.really_read_substring r strs
+      >>= (function
+       | `Eof _ -> Deferred.unit
+       | `Ok ->
+         on_error errcode (Substring.to_string strs);
+         (* TODO: close only if fatal. *)
+         don't_wait_for (close t);
+         loop ())
+  in
+  loop ()
+;;
+
+(* We set a timeout of one second by default. *)
+let create ?driver_timeout ?(idle = Time_ns.Span.of_int_ms 1) ~on_error dir =
+  let nfo = Info.create_s [%message "Aeron_async.create"] in
+  Unix.pipe nfo
+  >>= fun (`Reader r, `Writer w) ->
+  let ba = Bigstring.create 8 in
+  Bigstring.set_uint16_be_exn ba ~pos:0 (Fd.to_int_exn w);
+  let ctx = Context.create ba in
+  Context.set_dir ctx dir;
+  Option.iter driver_timeout ~f:(fun x ->
+    Context.set_driver_timeout_ms ctx (Time_ns.Span.to_int_ms x));
+  Context.set_use_conductor_agent_invoker ctx true;
+  (* this might block then return an exn. *)
+  Monitor.try_with_or_error (fun () -> In_thread.run (fun () -> init_exn ctx))
+  >>|? fun client ->
+  let pubs = Endpoint.Table.create () in
+  let stop = Ivar.create () in
+  let subs = Uuid.Table.create () in
+  let t = Fields.create ~ctx ~ba ~client ~pubs ~stop ~subs in
+  don't_wait_for (process_reader t on_error (Reader.create r));
+  start_polling t on_error idle;
+  t
+;;
+
+let is_closed { stop; _ } = Ivar.is_full stop
+let close_finished { stop; _ } = Ivar.read stop
 
 let add_publication { client; pubs; _ } kind chan streamID encode =
   let endp = Endpoint.create chan streamID in
@@ -147,22 +213,24 @@ module Subscription = struct
   type sub =
     { sub : Subscription.t
     ; r : Reader.t
-    ; wfd : Fd.t
+    ; uuid : Uuid.t
     }
   [@@deriving fields]
 
   let create t uri streamID =
-    let wait = Aeron.Subscription.add t.client uri (Int.to_int32_exn streamID) in
-    Unix.pipe (Info.of_string "aeron_subscription_add_pipe")
+    let uuid = Uuid.create_random Base.Random.State.default in
+    Unix.pipe (Info.of_string (Uuid.to_string uuid))
     >>= function
     | `Reader rfd, `Writer wfd ->
-      let wfd_raw = Fd.file_descr_exn wfd in
+      let wait = Aeron.Subscription.add t.client uri (Int.to_int32_exn streamID) in
+      let wfd_raw = Fd.to_int_exn wfd in
       let rec loop () =
         match Aeron.Subscription.add_poll wait wfd_raw with
         | None -> Scheduler.yield () >>= loop
         | Some sub ->
           let r = Reader.create rfd in
-          return (Fields_of_sub.create ~sub ~r ~wfd)
+          Hashtbl.set t.subs ~key:uuid ~data:r;
+          return (Fields_of_sub.create ~sub ~r ~uuid)
       in
       loop ()
   ;;
@@ -173,81 +241,83 @@ module Subscription = struct
       match Subscription.is_closed t.sub with
       | true ->
         (* cleanup *)
-        Fd.close t.wfd
+        Reader.close t.r
       | false -> Scheduler.yield () >>= loop
     in
     loop ()
   ;;
-end
 
-let poll_subscription
-      ?(stop = Deferred.never ())
-      ?(wait = Time_ns.Span.of_int_us 10)
-      ?(max_fragments = 10)
-      (sub : Subscription.sub)
-      f
-  =
-  (* Repeatedly [max_fragments] till [stop] is determined. *)
-  let close_sub =
-    lazy
-      (Lo.debug (fun m -> m "Closing subscription");
-       Subscription.close sub
-       >>= fun () ->
-       Lo.debug (fun m -> m "Closed subscription");
-       Reader.close sub.r)
-  in
-  don't_wait_for
-    (let rec loop () =
-       match Aeron.Subscription.poll_exn sub.sub max_fragments with
-       | exception exn ->
-         Lo.err (fun m -> m "%s" (Exn.to_string exn));
-         Lazy.force close_sub
-       | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
-       | _ -> Clock_ns.after wait >>= loop
-     in
-     loop ());
-  let bbuf = Bigbuffer.create 4096 in
-  let hdr = Bigstring.create Header.sizeof_values in
-  let shdr = Bigsubstring.create hdr in
-  let buf = Bigstring.create 4096 in
-  let rec loop () =
-    (* read hdr *)
-    Reader.really_read_bigsubstring sub.r shdr
-    >>= function
-    | `Eof _ ->
-      (* TODO: ok? *)
-      Deferred.unit
-    | `Ok ->
-      let h = Header.of_cstruct (Cstruct.of_bigarray hdr) in
-      let len = Int32.to_int_exn h.frame.frame_length - 32 in
-      (* now read len bytes of payload *)
-      Lo.debug (fun m -> m "Read %d bytes from sub" len);
-      Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
-      >>= (function
-       | `Eof _ ->
-         (* TODO: ok? *)
-         Deferred.unit
-       | `Ok ->
-         (* Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray buf ~len)); *)
-         (match h.frame.flags lsr 6 with
-          | 3 ->
-            (* unique frame *)
-            f (Iobuf.of_bigstring buf ~len);
-            loop ()
-          | 2 ->
-            (* first frame *)
-            Bigbuffer.clear bbuf;
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            loop ()
-          | 0 ->
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            loop ()
-          | _ ->
-            (* last frame *)
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            let len = Bigbuffer.length bbuf in
-            f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
-            loop ()))
-  in
-  loop ()
-;;
+  let start_polling_loop
+        ?(stop = Deferred.never ())
+        ?(wait = Time_ns.Span.of_int_ms 1)
+        ?(max_fragments = 10)
+        (sub : sub)
+        f
+    =
+    (* Repeatedly [max_fragments] till [stop] is determined. *)
+    let close_sub =
+      lazy
+        (Lo.debug (fun m -> m "Closing subscription");
+         close sub >>| fun () -> Lo.debug (fun m -> m "Closed subscription"))
+    in
+    (* Launch polling loop. *)
+    don't_wait_for
+      (let rec loop () =
+         if Reader.is_closed sub.r
+         then Deferred.unit
+         else (
+           match Aeron.Subscription.poll_exn sub.sub max_fragments with
+           | exception exn ->
+             Lo.err (fun m -> m "%s" (Exn.to_string exn));
+             Lazy.force close_sub
+           | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
+           | _ -> Clock_ns.after wait >>= loop)
+       in
+       loop ());
+    let bbuf = Bigbuffer.create 4096 in
+    let hdr = Bigstring.create Header.sizeof_values in
+    let shdr = Bigsubstring.create hdr in
+    let buf = Bigstring.create 4096 in
+    (* Read data from the C callback via a fd/Reader.t *)
+    let rec loop () =
+      (* read hdr *)
+      Reader.really_read_bigsubstring sub.r shdr
+      >>= function
+      | `Eof _ ->
+        (* TODO: ok? *)
+        Deferred.unit
+      | `Ok ->
+        let h = Header.of_cstruct (Cstruct.of_bigarray hdr) in
+        let len = Int32.to_int_exn h.frame.frame_length - 32 in
+        (* now read len bytes of payload *)
+        Lo.debug (fun m -> m "Read %d bytes from sub" len);
+        Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
+        >>= (function
+         | `Eof _ ->
+           (* TODO: ok? *)
+           Deferred.unit
+         | `Ok ->
+           (* Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray buf ~len)); *)
+           (match h.frame.flags lsr 6 with
+            | 3 ->
+              (* unique frame *)
+              f (Iobuf.of_bigstring buf ~len);
+              loop ()
+            | 2 ->
+              (* first frame *)
+              Bigbuffer.clear bbuf;
+              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+              loop ()
+            | 0 ->
+              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+              loop ()
+            | _ ->
+              (* last frame *)
+              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+              let len = Bigbuffer.length bbuf in
+              f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
+              loop ()))
+    in
+    loop ()
+  ;;
+end

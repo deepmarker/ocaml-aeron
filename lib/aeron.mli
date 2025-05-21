@@ -1,16 +1,36 @@
+module Err : sig
+  type t =
+    | Driver_timeout
+    | Client_timeout
+    | Conductor_service_timeout
+    | Buffer_full
+  [@@deriving sexp]
+
+  val pp : Format.formatter -> t -> unit
+  val to_int : t -> int
+  val of_int : int -> t
+end
+
 module Context : sig
+  (** Type of a context. Must NOT be reused between clients! *)
   type t
 
-  val create : unit -> t
+  val create : Bigstringaf.t -> t
   val close : t -> unit
   val set_dir : t -> string -> unit
   val set_driver_timeout_ms : t -> int -> unit
+  val get_driver_timeout_ms : t -> int
+  val set_use_conductor_agent_invoker : t -> bool -> unit
+  val get_use_conductor_agent_invoker : t -> bool
 end
 
 type t
 
-val init : Context.t -> t
+val init_exn : Context.t -> t
 val start : t -> unit
+val main_do_work : t -> int
+val errmsg : unit -> string
+val errcode : unit -> Err.t
 val close : t -> unit
 
 module Header : sig
@@ -49,7 +69,7 @@ module Subscription : sig
   [@@deriving sexp]
 
   val add : conn -> Uri.t -> int32 -> add
-  val add_poll : add -> Unix.file_descr -> t option
+  val add_poll : add -> int -> t option
   val close : t -> unit
   val is_closed : t -> bool
 
