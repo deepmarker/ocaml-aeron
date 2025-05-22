@@ -4,8 +4,6 @@ open Aeron
 
 type t
 
-include Persistent_connection_kernel.Closable with type t := t
-
 val create
   :  ?driver_timeout:Time_ns.Span.t
   -> ?idle:Time_ns.Span.t
@@ -13,41 +11,43 @@ val create
   -> string
   -> t Deferred.Or_error.t
 
-module Publication : sig
-  type _ t
+include Persistent_connection_kernel.Closable with type t := t
 
-  val close : _ t -> unit Deferred.t
-  val offer : 'a t -> 'a -> OfferResult.t
-  val consts : _ t -> pub_consts
-end
+(** When the functions below get used with a closed  [t], they will raise an exception. *)
 
-module Subscription : sig
-  type sub
+(** Subscription *)
 
-  val create : t -> Uri.t -> int -> sub Deferred.t
-  val close : sub -> unit Deferred.t
+type subscription
 
-  val start_polling_loop
-    :  ?stop:_ Deferred.t
-    -> ?wait:Time_ns.Span.t
-    -> ?max_fragments:int
-    -> sub
-    -> ((read, Iobuf.seek) Iobuf.t -> unit)
-    -> unit Deferred.t
-end
-
-val add_publication
-  :  t
-  -> [< `Concurrent | `Exclusive ]
+val add_subscription
+  :  ?stop:_ Deferred.t
+  -> ?period:Time_ns.Span.t
+  -> ?max_fragments:int
+  -> t
   -> Uri.t
-  -> int
-  -> ('a -> (read, Iobuf.seek) Iobuf.t)
-  -> [> `Duplicate | `Ok of 'a Publication.t ] Deferred.t
+  -> streamID:int32
+  -> (([< read_write ], 'b) Iobuf.t -> unit)
+  -> (subscription * Subscription.consts) Deferred.t
 
-val add_publication_exn
+val close_subscription : t -> subscription -> unit Deferred.t
+
+(** Publication *)
+
+type 'a publication
+
+val add_concurrent_publication
   :  t
-  -> [< `Concurrent | `Exclusive ]
   -> Uri.t
-  -> int
+  -> streamID:int32
   -> ('a -> (read, Iobuf.seek) Iobuf.t)
-  -> 'a Publication.t Deferred.t
+  -> ('a publication * pub_consts) Deferred.t
+
+val add_exclusive_publication
+  :  t
+  -> Uri.t
+  -> streamID:int32
+  -> ('a -> (read, Iobuf.seek) Iobuf.t)
+  -> ('a publication * pub_consts) Deferred.t
+
+val offer : t -> 'a publication -> 'a -> OfferResult.t
+val close_publication : t -> 'a publication -> unit Deferred.t

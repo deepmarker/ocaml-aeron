@@ -35,62 +35,37 @@ module MkPublication (P : Publication_sig) = struct
   let consts = P.consts
 end
 
-module Publication = struct
-  module ConcurrentPublication = MkPublication (Publication)
-  module ExclusivePublication = MkPublication (ExclusivePublication)
+module ConcurrentPublication = MkPublication (Publication)
+module ExclusivePublication = MkPublication (ExclusivePublication)
 
-  type pub =
-    | Concurrent of Aeron.Publication.t
-    | Exclusive of Aeron.ExclusivePublication.t
+type 'a publication =
+  { pub : pub_kind
+  ; encode : 'a -> (read, Iobuf.seek) Iobuf.t
+  }
 
-  type 'a t =
-    { pub : pub
-    ; encode : 'a -> (read, Iobuf.seek) Iobuf.t
-    }
+and pub_kind =
+  | Concurrent of Aeron.Publication.t
+  | Exclusive of Aeron.ExclusivePublication.t
 
-  let close { pub; _ } =
-    match pub with
-    | Concurrent x -> ConcurrentPublication.close x
-    | Exclusive x -> ExclusivePublication.close x
-  ;;
+let add_concurrent t uri streamID encode =
+  ConcurrentPublication.add t uri streamID >>| fun x -> { pub = Concurrent x; encode }
+;;
 
-  let add_concurrent t uri streamID encode =
-    ConcurrentPublication.add t uri streamID >>| fun x -> { pub = Concurrent x; encode }
-  ;;
+let add_exclusive t uri streamID encode =
+  ExclusivePublication.add t uri streamID >>| fun x -> { pub = Exclusive x; encode }
+;;
 
-  let add_exclusive t uri streamID encode =
-    ExclusivePublication.add t uri streamID >>| fun x -> { pub = Exclusive x; encode }
-  ;;
+let publication_consts { pub; _ } =
+  match pub with
+  | Concurrent x -> ConcurrentPublication.consts x
+  | Exclusive x -> ExclusivePublication.consts x
+;;
 
-  let offer { pub; encode } msg =
-    match pub with
-    | Concurrent x -> ConcurrentPublication.offer x (encode msg)
-    | Exclusive x -> ExclusivePublication.offer x (encode msg)
-  ;;
-
-  let consts { pub; _ } =
-    match pub with
-    | Concurrent x -> ConcurrentPublication.consts x
-    | Exclusive x -> ExclusivePublication.consts x
-  ;;
-end
-
-module Endpoint = struct
-  module T = struct
-    type t =
-      { chn : string
-      ; stream : int32
-      }
-    [@@deriving compare, hash, bin_io, sexp, fields]
-  end
-
-  include T
-
-  let create chn stream = { chn = Uri.to_string chn; stream = Int32.of_int_exn stream }
-
-  include Comparable.Make (T)
-  include Hashable.Make (T)
-end
+type subscription =
+  { sub : Subscription.t
+  ; r : Reader.t
+  }
+[@@deriving fields]
 
 type t =
   { ctx : Context.t
@@ -98,28 +73,47 @@ type t =
     (* useless here but must not be GCed, contains fd information for
        C -> OCaml errors. *)
   ; client : Aeron.t
-  ; pubs : pub Endpoint.Table.t
+  ; pubs : pub Int64.Table.t
   ; stop : unit Ivar.t
-  ; subs : Reader.t Uuid.Table.t
+  ; subs : subscription Int64.Table.t
   }
 
-and pub = P : 'a Publication.t -> pub [@@deriving fields]
+and pub = P : 'a publication -> pub [@@deriving fields]
 
-let close { client; ctx; pubs; stop; subs; _ } =
-  Lo.debug (fun m -> m "start closing aeron client");
-  let pubs = Hashtbl.to_alist pubs in
-  let subs = Hashtbl.to_alist subs in
-  Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, r) -> Reader.close r)
-  >>= fun () ->
-  Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) -> Publication.close pub)
-  >>| fun () ->
-  (* stop polling *)
-  Lo.debug (fun m -> m "closing aeron client: fill ivar and call close");
-  Aeron.close client;
-  Aeron.Context.close ctx;
-  (* Signaling the start of closing? This will trigger a reconnect
+let offer t { pub; encode } msg =
+  if Ivar.is_full t.stop then invalid_arg "offer: context closed";
+  match pub with
+  | Concurrent pub -> ConcurrentPublication.offer pub (encode msg)
+  | Exclusive pub -> ExclusivePublication.offer pub (encode msg)
+;;
+
+let close_publication t { pub; _ } =
+  if Ivar.is_full t.stop then invalid_arg "close_publication: context closed";
+  match pub with
+  | Concurrent x -> ConcurrentPublication.close x
+  | Exclusive x -> ExclusivePublication.close x
+;;
+
+let close ({ client; ctx; pubs; stop; subs; _ } as t) =
+  match Ivar.is_full stop with
+  | true ->
+    (* Already closed! Not idempotent! *)
+    Deferred.unit
+  | false ->
+    Lo.debug (fun m -> m "start closing aeron client");
+    let pubs = Hashtbl.to_alist pubs in
+    let subs = Hashtbl.to_alist subs in
+    Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, { r; _ }) -> Reader.close r)
+    >>= fun () ->
+    Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) -> close_publication t pub)
+    >>| fun () ->
+    (* stop polling *)
+    Lo.debug (fun m -> m "closing aeron client: fill ivar and call close");
+    Aeron.close client;
+    Aeron.Context.close ctx;
+    (* Signaling the start of closing? This will trigger a reconnect
      when using persistent connection. *)
-  Ivar.fill_if_empty stop ()
+    Ivar.fill_if_empty stop ()
 ;;
 
 let start_polling t on_error span =
@@ -173,9 +167,9 @@ let create ?driver_timeout ?(idle = Time_ns.Span.of_int_ms 1) ~on_error dir =
   (* this might block then return an exn. *)
   Monitor.try_with_or_error (fun () -> In_thread.run (fun () -> init_exn ctx))
   >>|? fun client ->
-  let pubs = Endpoint.Table.create () in
+  let pubs = Int64.Table.create () in
   let stop = Ivar.create () in
-  let subs = Uuid.Table.create () in
+  let subs = Int64.Table.create () in
   let t = Fields.create ~ctx ~ba ~client ~pubs ~stop ~subs in
   don't_wait_for (process_reader t on_error (Reader.create r));
   start_polling t on_error idle;
@@ -185,139 +179,134 @@ let create ?driver_timeout ?(idle = Time_ns.Span.of_int_ms 1) ~on_error dir =
 let is_closed { stop; _ } = Ivar.is_full stop
 let close_finished { stop; _ } = Ivar.read stop
 
-let add_publication { client; pubs; _ } kind chan streamID encode =
-  let endp = Endpoint.create chan streamID in
-  match Hashtbl.find pubs endp, kind with
-  | None, `Concurrent ->
-    Publication.add_concurrent client chan endp.stream encode
-    >>| fun x ->
-    Hashtbl.set pubs ~key:endp ~data:(P x);
-    `Ok x
-  | None, `Exclusive ->
-    Publication.add_exclusive client chan endp.stream encode
-    >>| fun x ->
-    Hashtbl.set pubs ~key:endp ~data:(P x);
-    `Ok x
-  | Some _, _ -> return `Duplicate
+let add_concurrent_publication { client; pubs; stop; _ } chan ~streamID encode =
+  if Ivar.is_full stop then invalid_arg "add_concurrent_publication: context closed";
+  add_concurrent client chan streamID encode
+  >>| fun x ->
+  let consts = publication_consts x in
+  Hashtbl.set pubs ~key:consts.registration_id ~data:(P x);
+  x, consts
 ;;
 
-let add_publication_exn t kind chan streamID encode =
-  add_publication t kind chan streamID encode
-  >>= function
-  | `Ok x -> return x
-  | `Duplicate ->
-    raise_s [%message "duplicate stream" ~chan:(chan : Uri.t) ~id:(streamID : int)]
+let add_exclusive_publication { client; pubs; stop; _ } chan ~streamID encode =
+  if Ivar.is_full stop then invalid_arg "add_exclusive_publication: context closed";
+  add_exclusive client chan streamID encode
+  >>| fun x ->
+  let consts = publication_consts x in
+  Hashtbl.set pubs ~key:consts.registration_id ~data:(P x);
+  x, consts
 ;;
 
-module Subscription = struct
-  type sub =
-    { sub : Subscription.t
-    ; r : Reader.t
-    ; uuid : Uuid.t
-    }
-  [@@deriving fields]
+let close_subscription_aux { sub; r } =
+  Subscription.close sub;
+  let rec loop () =
+    match Subscription.is_closed sub with
+    | true ->
+      (* cleanup *)
+      Reader.close r
+    | false -> Scheduler.yield () >>= loop
+  in
+  loop ()
+;;
 
-  let create t uri streamID =
-    let uuid = Uuid.create_random Base.Random.State.default in
-    Unix.pipe (Info.of_string (Uuid.to_string uuid))
+let close_subscription t x =
+  if Ivar.is_full t.stop
+  then invalid_arg "close_subscription: context closed"
+  else close_subscription_aux x
+;;
+
+let start_polling_subscription
+      ?(stop = Deferred.never ())
+      ?(period = Time_ns.Span.of_int_ms 1)
+      ?(max_fragments = 10)
+      (sub : subscription)
+      f
+  =
+  (* Repeatedly [max_fragments] till [stop] is determined. *)
+  let close_sub =
+    lazy
+      (Lo.debug (fun m -> m "Closing subscription");
+       close_subscription_aux sub
+       >>| fun () -> Lo.debug (fun m -> m "Closed subscription"))
+  in
+  (* Launch polling loop. *)
+  don't_wait_for
+    (let rec loop () =
+       if Reader.is_closed sub.r
+       then Deferred.unit
+       else (
+         match Aeron.Subscription.poll_exn sub.sub max_fragments with
+         | exception exn ->
+           Lo.err (fun m -> m "%s" (Exn.to_string exn));
+           Lazy.force close_sub
+         | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
+         | _ -> Clock_ns.after period >>= loop)
+     in
+     loop ());
+  let bbuf = Bigbuffer.create 4096 in
+  let hdr = Bigstring.create Header.sizeof_values in
+  let shdr = Bigsubstring.create hdr in
+  let buf = Bigstring.create 4096 in
+  (* Read data from the C callback via a fd/Reader.t *)
+  let rec loop () =
+    (* read hdr *)
+    Reader.really_read_bigsubstring sub.r shdr
     >>= function
-    | `Reader rfd, `Writer wfd ->
-      let wait = Aeron.Subscription.add t.client uri (Int.to_int32_exn streamID) in
-      let wfd_raw = Fd.to_int_exn wfd in
-      let rec loop () =
-        match Aeron.Subscription.add_poll wait wfd_raw with
-        | None -> Scheduler.yield () >>= loop
-        | Some sub ->
-          let r = Reader.create rfd in
-          Hashtbl.set t.subs ~key:uuid ~data:r;
-          return (Fields_of_sub.create ~sub ~r ~uuid)
-      in
-      loop ()
-  ;;
+    | `Eof _ ->
+      (* TODO: ok? *)
+      Deferred.unit
+    | `Ok ->
+      let h = Header.of_cstruct (Cstruct.of_bigarray hdr) in
+      let len = Int32.to_int_exn h.frame.frame_length - 32 in
+      (* now read len bytes of payload *)
+      Lo.debug (fun m -> m "Read %d bytes from sub" len);
+      Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
+      >>= (function
+       | `Eof _ ->
+         (* TODO: ok? *)
+         Deferred.unit
+       | `Ok ->
+         (* Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray buf ~len)); *)
+         (match h.frame.flags lsr 6 with
+          | 3 ->
+            (* unique frame *)
+            f (Iobuf.of_bigstring buf ~len);
+            loop ()
+          | 2 ->
+            (* first frame *)
+            Bigbuffer.clear bbuf;
+            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            loop ()
+          | 0 ->
+            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            loop ()
+          | _ ->
+            (* last frame *)
+            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            let len = Bigbuffer.length bbuf in
+            f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
+            loop ()))
+  in
+  loop ()
+;;
 
-  let close t =
-    Subscription.close t.sub;
+let add_subscription ?stop ?period ?max_fragments t uri ~streamID f =
+  if Ivar.is_full t.stop then invalid_arg "add_subscription: context closed";
+  Unix.pipe (Info.of_string "Aeron_async.add_subscription")
+  >>= function
+  | `Reader rfd, `Writer wfd ->
+    let sub_req = Aeron.Subscription.add t.client uri streamID in
+    let wfd_raw = Fd.to_int_exn wfd in
     let rec loop () =
-      match Subscription.is_closed t.sub with
-      | true ->
-        (* cleanup *)
-        Reader.close t.r
-      | false -> Scheduler.yield () >>= loop
+      match Aeron.Subscription.add_poll sub_req wfd_raw with
+      | None -> Scheduler.yield () >>= loop
+      | Some sub ->
+        let consts = Subscription.consts sub in
+        let r = Reader.create rfd in
+        let sub = Fields_of_subscription.create ~sub ~r in
+        Hashtbl.set t.subs ~key:consts.registration_id ~data:sub;
+        don't_wait_for (start_polling_subscription ?stop ?period ?max_fragments sub f);
+        return (sub, consts)
     in
     loop ()
-  ;;
-
-  let start_polling_loop
-        ?(stop = Deferred.never ())
-        ?(wait = Time_ns.Span.of_int_ms 1)
-        ?(max_fragments = 10)
-        (sub : sub)
-        f
-    =
-    (* Repeatedly [max_fragments] till [stop] is determined. *)
-    let close_sub =
-      lazy
-        (Lo.debug (fun m -> m "Closing subscription");
-         close sub >>| fun () -> Lo.debug (fun m -> m "Closed subscription"))
-    in
-    (* Launch polling loop. *)
-    don't_wait_for
-      (let rec loop () =
-         if Reader.is_closed sub.r
-         then Deferred.unit
-         else (
-           match Aeron.Subscription.poll_exn sub.sub max_fragments with
-           | exception exn ->
-             Lo.err (fun m -> m "%s" (Exn.to_string exn));
-             Lazy.force close_sub
-           | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
-           | _ -> Clock_ns.after wait >>= loop)
-       in
-       loop ());
-    let bbuf = Bigbuffer.create 4096 in
-    let hdr = Bigstring.create Header.sizeof_values in
-    let shdr = Bigsubstring.create hdr in
-    let buf = Bigstring.create 4096 in
-    (* Read data from the C callback via a fd/Reader.t *)
-    let rec loop () =
-      (* read hdr *)
-      Reader.really_read_bigsubstring sub.r shdr
-      >>= function
-      | `Eof _ ->
-        (* TODO: ok? *)
-        Deferred.unit
-      | `Ok ->
-        let h = Header.of_cstruct (Cstruct.of_bigarray hdr) in
-        let len = Int32.to_int_exn h.frame.frame_length - 32 in
-        (* now read len bytes of payload *)
-        Lo.debug (fun m -> m "Read %d bytes from sub" len);
-        Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
-        >>= (function
-         | `Eof _ ->
-           (* TODO: ok? *)
-           Deferred.unit
-         | `Ok ->
-           (* Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray buf ~len)); *)
-           (match h.frame.flags lsr 6 with
-            | 3 ->
-              (* unique frame *)
-              f (Iobuf.of_bigstring buf ~len);
-              loop ()
-            | 2 ->
-              (* first frame *)
-              Bigbuffer.clear bbuf;
-              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-              loop ()
-            | 0 ->
-              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-              loop ()
-            | _ ->
-              (* last frame *)
-              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-              let len = Bigbuffer.length bbuf in
-              f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
-              loop ()))
-    in
-    loop ()
-  ;;
-end
+;;

@@ -94,7 +94,7 @@ module OfferResult : sig
 end
 
 type pub_consts =
-  { orig_registrsation_id : int64
+  { orig_registration_id : int64
   ; registration_id : int64
   ; max_possible_position : int64
   ; position_bits_to_shift : int64

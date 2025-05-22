@@ -36,23 +36,22 @@ let subscribe_direct driver_timeout prefix chan streamID =
   in
   let terminate = Ivar.create () in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
+  let streamID = Int32.of_int_exn streamID in
   let handle client =
     Lo.debug (fun m -> m "start handle");
-    Subscription.create client chan streamID
-    >>= fun sub ->
-    Lo.info (fun m -> m "Subscription created");
-    Monitor.protect
-      (fun () -> Subscription.start_polling_loop ~stop:(Ivar.read terminate) sub cb)
-      ~finally:(fun () ->
-        Subscription.close sub >>| fun () -> Lo.info (fun m -> m "Cleanup done"))
-    >>= fun () ->
+    Aeron_async.add_subscription client chan ~streamID cb
+    >>= fun (_sub, consts) ->
+    Lo.info (fun m ->
+      m "Subscription created %a" Sexp.pp (Subscription.sexp_of_consts consts));
     (* Important: wait till client is closed before looping. *)
-    if Ivar.is_full terminate then Deferred.unit else close_finished client
+    Deferred.any [ Ivar.read terminate; close_finished client ]
   in
   let rec loop () =
     if Ivar.is_full terminate
     then Deferred.unit
-    else PersistentAeron.connected conn >>= fun client -> handle client >>= loop
+    else
+      PersistentAeron.connected conn
+      >>= fun client -> handle client >>= fun () -> close client >>= loop
   in
   loop ()
 ;;
@@ -96,7 +95,7 @@ let subscribe =
          subscribe_direct timeout prefix chan streamID])
 ;;
 
-let publish driver_timeout dir channel stream sz =
+let publish driver_timeout dir channel streamID sz =
   let channel = Uri.of_string channel in
   let conn =
     PersistentAeron.create
@@ -114,10 +113,10 @@ let publish driver_timeout dir channel stream sz =
     PersistentAeron.connected conn
     >>= fun client ->
     Lo.info (fun m -> m "Client created");
-    Aeron_async.add_publication_exn client `Exclusive channel stream Fn.id
-    >>= fun pub ->
+    let streamID = Int32.of_int_exn streamID in
+    Aeron_async.add_exclusive_publication client channel ~streamID Fn.id
+    >>= fun (pub, consts) ->
     Lo.info (fun m -> m "Exclusive publication created");
-    let consts = Publication.consts pub in
     Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
     let msg = Iobuf.create ~len:sz in
     for i = 0 to sz - 1 do
@@ -130,7 +129,7 @@ let publish driver_timeout dir channel stream sz =
       match is_closed client || Ivar.is_full terminate with
       | true -> Deferred.unit
       | false ->
-        (match Publication.offer pub msg with
+        (match offer client pub msg with
          | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
          | x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferResult.sexp_of_t x)));
         Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
