@@ -6,6 +6,7 @@ module Err = struct
     | Client_timeout
     | Conductor_service_timeout
     | Buffer_full
+    | Unknown of int
   [@@deriving sexp]
 
   let of_int = function
@@ -13,7 +14,7 @@ module Err = struct
     | -1001 -> Client_timeout
     | -1002 -> Conductor_service_timeout
     | -1003 -> Buffer_full
-    | _ -> assert false
+    | i -> Unknown i
   ;;
 
   let to_int = function
@@ -21,6 +22,7 @@ module Err = struct
     | Client_timeout -> -1001
     | Conductor_service_timeout -> -1002
     | Buffer_full -> -1003
+    | Unknown i -> i
   ;;
 
   let pp ppf t = Sexplib.Sexp.pp ppf (sexp_of_t t)

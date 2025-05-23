@@ -4,6 +4,7 @@ module Err : sig
     | Client_timeout
     | Conductor_service_timeout
     | Buffer_full
+    | Unknown of int
   [@@deriving sexp]
 
   val pp : Format.formatter -> t -> unit
