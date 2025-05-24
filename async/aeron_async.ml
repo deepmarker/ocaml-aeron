@@ -87,14 +87,18 @@ let offer t { pub; encode } msg =
   | Exclusive pub -> ExclusivePublication.offer pub (encode msg)
 ;;
 
-let close_publication t { pub; _ } =
-  if Ivar.is_full t.stop then invalid_arg "close_publication: context closed";
+let close_publication_aux pub =
   match pub with
   | Concurrent x -> ConcurrentPublication.close x
   | Exclusive x -> ExclusivePublication.close x
 ;;
 
-let close ({ client; ctx; pubs; stop; subs; _ } as t) =
+let close_publication t { pub; _ } =
+  if Ivar.is_full t.stop then invalid_arg "close_publication: context closed";
+  close_publication_aux pub
+;;
+
+let close { client; ctx; pubs; stop; subs; _ } =
   match Ivar.is_full stop with
   | true ->
     (* Already closed! Not idempotent! *)
@@ -110,8 +114,8 @@ let close ({ client; ctx; pubs; stop; subs; _ } as t) =
       (fun () ->
          Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, { r; _ }) -> Reader.close r)
          >>= fun () ->
-         Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) ->
-           close_publication t pub))
+         Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P { pub; _ }) ->
+           close_publication_aux pub))
       ~finally:(fun () ->
         (* stop polling *)
         Lo.debug (fun m -> m "closing (freeing) aeron client C structures");
