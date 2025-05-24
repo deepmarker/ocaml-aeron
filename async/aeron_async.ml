@@ -100,20 +100,24 @@ let close ({ client; ctx; pubs; stop; subs; _ } as t) =
     (* Already closed! Not idempotent! *)
     Deferred.unit
   | false ->
+    (* Signaling the start of closing? This will trigger a reconnect
+     when using persistent connection. *)
+    Ivar.fill_if_empty stop ();
     Lo.debug (fun m -> m "start closing aeron client");
     let pubs = Hashtbl.to_alist pubs in
     let subs = Hashtbl.to_alist subs in
-    Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, { r; _ }) -> Reader.close r)
-    >>= fun () ->
-    Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) -> close_publication t pub)
-    >>| fun () ->
-    (* stop polling *)
-    Lo.debug (fun m -> m "closing aeron client: fill ivar and call close");
-    Aeron.close client;
-    Aeron.Context.close ctx;
-    (* Signaling the start of closing? This will trigger a reconnect
-     when using persistent connection. *)
-    Ivar.fill_if_empty stop ()
+    Monitor.protect
+      (fun () ->
+         Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, { r; _ }) -> Reader.close r)
+         >>= fun () ->
+         Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P pub) ->
+           close_publication t pub))
+      ~finally:(fun () ->
+        (* stop polling *)
+        Lo.debug (fun m -> m "closing (freeing) aeron client C structures");
+        Aeron.close client;
+        Aeron.Context.close ctx;
+        Deferred.unit)
 ;;
 
 let start_polling t on_error span =
