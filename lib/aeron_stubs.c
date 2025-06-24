@@ -86,17 +86,6 @@ static struct custom_operations add_subscription_ops = {
   custom_fixed_length_default
 };
 
-static struct custom_operations subscription_ops = {
-  "aeron.subscription",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
 #define Context_val(v) (*(aeron_context_t **) Data_custom_val(v))
 #define Client_val(v) (*(aeron_t **) Data_custom_val(v))
 #define Add_publication_val(v) (*((aeron_async_add_publication_t **) Data_custom_val(v)))
@@ -289,13 +278,13 @@ CAMLprim value ml_aeron_async_add_publication_poll (value async) {
     int ret = aeron_async_add_publication_poll(&Publication_val(x),
                                                Add_publication_val(async));
     switch(ret) {
-    case -1:
-        caml_failwith(aeron_errmsg());
     case 0:
         CAMLreturn(Val_none);
     case 1:
         res = caml_alloc_some(x);
         CAMLreturn(res);
+    default:
+        caml_failwith(aeron_errmsg());
     }
 }
 
@@ -308,13 +297,13 @@ CAMLprim value ml_aeron_async_add_excl_publication_poll (value async) {
     int ret = aeron_async_add_exclusive_publication_poll(&Excl_publication_val(x),
                                                          Add_excl_publication_val(async));
     switch (ret) {
-    case -1:
-      caml_failwith(aeron_errmsg());
     case 0:
       CAMLreturn(Val_none);
     case 1:
       res = caml_alloc_some(x);
       CAMLreturn(res);
+    default:
+      caml_failwith(aeron_errmsg());
     }
 }
 
