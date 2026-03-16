@@ -27,11 +27,7 @@ module MkPublication (P : Publication_sig) = struct
     loop ()
   ;;
 
-  let offer t msg =
-    let sub = Iobuf.Consume.To_bigstring.subo msg in
-    P.offer t sub
-  ;;
-
+  let offer t ?pos ?len buf = P.offer ?pos ?len t buf
   let consts = P.consts
 end
 
@@ -40,7 +36,7 @@ module ExclusivePublication = MkPublication (ExclusivePublication)
 
 type 'a publication =
   { pub : pub_kind
-  ; encode : 'a -> (read, Iobuf.seek) Iobuf.t
+  ; encode : 'a -> Bigstring.t
   }
 
 and pub_kind =

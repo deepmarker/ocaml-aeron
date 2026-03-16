@@ -39,14 +39,14 @@ val add_concurrent_publication
   :  t
   -> Uri.t
   -> streamID:int32
-  -> ('a -> (read, Iobuf.seek) Iobuf.t)
+  -> ('a -> Bigstring.t)
   -> ('a publication * pub_consts) Deferred.t
 
 val add_exclusive_publication
   :  t
   -> Uri.t
   -> streamID:int32
-  -> ('a -> (read, Iobuf.seek) Iobuf.t)
+  -> ('a -> Bigstring.t)
   -> ('a publication * pub_consts) Deferred.t
 
 val offer : t -> 'a publication -> 'a -> OfferResult.t

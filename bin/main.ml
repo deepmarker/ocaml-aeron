@@ -118,18 +118,18 @@ let publish driver_timeout dir channel streamID sz =
     >>= fun (pub, consts) ->
     Lo.info (fun m -> m "Exclusive publication created");
     Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
-    let msg = Iobuf.create ~len:sz in
+    let buf = Bigstring.create sz in
+    let msg = Iobuf.of_bigstring buf in
     for i = 0 to sz - 1 do
       Iobuf.Fill.int8_trunc msg i
     done;
-    let msg = Iobuf.read_only msg in
     let rec loop pub i =
       (* Make it ready to consume. *)
       Iobuf.flip_lo msg;
       match is_closed client || Ivar.is_full terminate with
       | true -> Deferred.unit
       | false ->
-        (match offer client pub msg with
+        (match offer client pub buf with
          | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
          | x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferResult.sexp_of_t x)));
         Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
