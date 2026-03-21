@@ -9,91 +9,6 @@
 #include <caml/bigarray.h>
 #include <aeron/aeronc.h>
 
-static struct custom_operations context_ops = {
-  "aeron.context",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-static struct custom_operations client_ops = {
-  "aeron.client",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-static struct custom_operations add_publication_ops = {
-  "aeron.add_publication",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-static struct custom_operations publication_ops = {
-  "aeron.publication",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-static struct custom_operations add_excl_publication_ops = {
-  "aeron.add_exclusive_publication",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-static struct custom_operations excl_publication_ops = {
-  "aeron.exclusive_publication",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-static struct custom_operations add_subscription_ops = {
-  "aeron.add_subscription",
-  custom_finalize_default,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-#define Context_val(v) (*(aeron_context_t **) Data_custom_val(v))
-#define Client_val(v) (*(aeron_t **) Data_custom_val(v))
-#define Add_publication_val(v) (*((aeron_async_add_publication_t **) Data_custom_val(v)))
-#define Publication_val(v) (*((aeron_publication_t **) Data_custom_val(v)))
-#define Add_excl_publication_val(v) (*((aeron_async_add_exclusive_publication_t **) Data_custom_val(v)))
-#define Excl_publication_val(v) (*((aeron_exclusive_publication_t **) Data_custom_val(v)))
-#define Add_subscription_val(v) (*((aeron_async_add_subscription_t **) Data_custom_val(v)))
-
 // Helper function to ensure all bytes are written
 static ssize_t write_all(int fd, const void *buffer, size_t length) {
     const char *ptr = (const char *)buffer;
@@ -134,22 +49,21 @@ static void forward_errors(void *clientd, int errcode, const char *message) {
 
 CAMLprim value ml_aeron_context_init(value ba) {
     CAMLparam1(ba);
-    CAMLlocal1(x);
-    x = caml_alloc_custom(&context_ops, sizeof(aeron_context_t **), 0, 1);
-    int ret = aeron_context_init(&Context_val(x));
+    aeron_context_t *ctx;
+    int ret = aeron_context_init(&ctx);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
-    ret = aeron_context_set_error_handler(Context_val(x), forward_errors, Caml_ba_data_val(ba));
+    ret = aeron_context_set_error_handler(ctx, forward_errors, Caml_ba_data_val(ba));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
-    CAMLreturn(x);
+    CAMLreturn(Val_ptr(ctx));
 }
 
 CAMLprim value ml_aeron_context_close (value ctx) {
     CAMLparam1(ctx);
-    int ret = aeron_context_close(Context_val(ctx));
+    int ret = aeron_context_close(Ptr_val(ctx));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -158,7 +72,7 @@ CAMLprim value ml_aeron_context_close (value ctx) {
 
 CAMLprim value ml_aeron_context_set_dir(value ctx, value dir) {
     CAMLparam2(ctx, dir);
-    int ret = aeron_context_set_dir(Context_val(ctx), String_val(dir));
+    int ret = aeron_context_set_dir(Ptr_val(ctx), String_val(dir));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -167,7 +81,7 @@ CAMLprim value ml_aeron_context_set_dir(value ctx, value dir) {
 
 CAMLprim value ml_aeron_context_set_driver_timeout_ms(value ctx, value ms) {
     CAMLparam2(ctx, ms);
-    int ret = aeron_context_set_driver_timeout_ms(Context_val(ctx), Long_val(ms));
+    int ret = aeron_context_set_driver_timeout_ms(Ptr_val(ctx), Long_val(ms));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -175,13 +89,13 @@ CAMLprim value ml_aeron_context_set_driver_timeout_ms(value ctx, value ms) {
 }
 
 CAMLprim value ml_aeron_context_get_driver_timeout_ms(value ctx) {
-    uint64_t ret = aeron_context_get_driver_timeout_ms(Context_val(ctx));
+    uint64_t ret = aeron_context_get_driver_timeout_ms(Ptr_val(ctx));
     return Val_long(ret);
 }
 
 CAMLprim value ml_aeron_context_set_use_conductor_agent_invoker(value ctx, value x) {
     CAMLparam2(ctx, x);
-    int ret = aeron_context_set_use_conductor_agent_invoker(Context_val(ctx), Bool_val(x));
+    int ret = aeron_context_set_use_conductor_agent_invoker(Ptr_val(ctx), Bool_val(x));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -189,24 +103,23 @@ CAMLprim value ml_aeron_context_set_use_conductor_agent_invoker(value ctx, value
 }
 
 CAMLprim value ml_aeron_context_get_use_conductor_agent_invoker(value ctx) {
-    bool ret = aeron_context_get_use_conductor_agent_invoker(Context_val(ctx));
+    bool ret = aeron_context_get_use_conductor_agent_invoker(Ptr_val(ctx));
     return Val_bool(ret);
 }
 
 CAMLprim value ml_aeron_init (value ctx) {
     CAMLparam1(ctx);
-    CAMLlocal1(x);
-    x = caml_alloc_custom(&client_ops, sizeof(aeron_t **), 0, 1);
-    int ret = aeron_init(&Client_val(x), Context_val(ctx));
+    aeron_t *cli;
+    int ret = aeron_init(&cli, Ptr_val(ctx));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
-    CAMLreturn(x);
+    CAMLreturn(Val_ptr(cli));
 }
 
 CAMLprim value ml_aeron_start (value client) {
     CAMLparam1(client);
-    int ret = aeron_start(Client_val(client));
+    int ret = aeron_start(Ptr_val(client));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -214,7 +127,7 @@ CAMLprim value ml_aeron_start (value client) {
 }
 
 CAMLprim value ml_aeron_main_do_work(value client) {
-    return Val_int(aeron_main_do_work(Client_val(client)));
+    return Val_int(aeron_main_do_work(Ptr_val(client)));
 }
 
 CAMLprim value ml_aeron_errmsg(value unit) {
@@ -230,7 +143,7 @@ CAMLprim value ml_aeron_errcode(value unit) {
 
 CAMLprim value ml_aeron_close (value client) {
     CAMLparam1(client);
-    int ret = aeron_close(Client_val(client));
+    int ret = aeron_close(Ptr_val(client));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -238,50 +151,41 @@ CAMLprim value ml_aeron_close (value client) {
 }
 
 CAMLprim value ml_aeron_async_add_publication (value client, value uri, value stream_id) {
-    CAMLparam3(client, uri, stream_id);
-    CAMLlocal1(x);
-    x = caml_alloc_custom(&add_publication_ops,
-                          sizeof (aeron_async_add_publication_t **),
-                          0, 1);
-    int ret = aeron_async_add_publication(&Add_publication_val(x),
-                                          Client_val(client),
-                                          String_val(uri),
-                                          Int32_val(stream_id));
+  CAMLparam3(client, uri, stream_id);
+  aeron_async_add_publication_t *pub;
+  int ret = aeron_async_add_publication(&pub,
+                                        Ptr_val(client),
+                                        String_val(uri),
+                                        Int32_val(stream_id));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
-    CAMLreturn(x);
+    CAMLreturn(Val_ptr(pub));
 }
 
 CAMLprim value ml_aeron_async_add_excl_publication (value client, value uri, value stream_id) {
-    CAMLparam3(client, uri, stream_id);
-    CAMLlocal1(x);
-    x = caml_alloc_custom(&add_excl_publication_ops,
-                          sizeof (aeron_async_add_exclusive_publication_t **),
-                          0, 1);
-    int ret = aeron_async_add_exclusive_publication(&Add_excl_publication_val(x),
-                                                    Client_val(client),
-                                                    String_val(uri),
-                                                    Int32_val(stream_id));
+  CAMLparam3(client, uri, stream_id);
+  aeron_async_add_exclusive_publication_t *pub;
+  int ret = aeron_async_add_exclusive_publication(&pub,
+                                                  Ptr_val(client),
+                                                  String_val(uri),
+                                                  Int32_val(stream_id));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
-    CAMLreturn(x);
+    CAMLreturn(Val_ptr(pub));
 }
 
 CAMLprim value ml_aeron_async_add_publication_poll (value async) {
     CAMLparam1(async);
-    CAMLlocal2(x, res);
-    x = caml_alloc_custom(&publication_ops,
-                          sizeof (aeron_publication_t **),
-                          0, 1);
-    int ret = aeron_async_add_publication_poll(&Publication_val(x),
-                                               Add_publication_val(async));
+    CAMLlocal1(res);
+    aeron_publication_t *pub;
+    int ret = aeron_async_add_publication_poll(&pub, Ptr_val(async));
     switch(ret) {
     case 0:
         CAMLreturn(Val_none);
     case 1:
-        res = caml_alloc_some(x);
+        res = caml_alloc_some(Val_ptr(pub));
         CAMLreturn(res);
     default:
         caml_failwith(aeron_errmsg());
@@ -290,18 +194,15 @@ CAMLprim value ml_aeron_async_add_publication_poll (value async) {
 
 CAMLprim value ml_aeron_async_add_excl_publication_poll (value async) {
     CAMLparam1(async);
-    CAMLlocal2(x, res);
-    x = caml_alloc_custom(&excl_publication_ops,
-                          sizeof (aeron_exclusive_publication_t **),
-                          0, 1);
-    int ret = aeron_async_add_exclusive_publication_poll(&Excl_publication_val(x),
-                                                         Add_excl_publication_val(async));
+    CAMLlocal1(res);
+    aeron_exclusive_publication_t *pub;
+    int ret = aeron_async_add_exclusive_publication_poll(&pub, Ptr_val(async));
     switch (ret) {
     case 0:
-      CAMLreturn(Val_none);
+        CAMLreturn(Val_none);
     case 1:
-      res = caml_alloc_some(x);
-      CAMLreturn(res);
+        res = caml_alloc_some(Val_ptr(pub));
+        CAMLreturn(res);
     default:
       caml_failwith(aeron_errmsg());
     }
@@ -309,7 +210,7 @@ CAMLprim value ml_aeron_async_add_excl_publication_poll (value async) {
 
 CAMLprim value ml_aeron_publication_close(value pub, value a) {
     CAMLparam1(pub);
-    int ret = aeron_publication_close(Publication_val(pub), NULL, NULL);
+    int ret = aeron_publication_close(Ptr_val(pub), NULL, NULL);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -318,7 +219,7 @@ CAMLprim value ml_aeron_publication_close(value pub, value a) {
 
 CAMLprim value ml_aeron_excl_publication_close(value pub, value a) {
     CAMLparam1(pub);
-    int ret = aeron_exclusive_publication_close(Excl_publication_val(pub), NULL, NULL);
+    int ret = aeron_exclusive_publication_close(Ptr_val(pub), NULL, NULL);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
@@ -326,23 +227,23 @@ CAMLprim value ml_aeron_excl_publication_close(value pub, value a) {
 }
 
 CAMLprim value ml_aeron_publication_is_closed(value pub) {
-    return(Val_bool(aeron_publication_is_closed(Publication_val(pub))));
+    return(Val_bool(aeron_publication_is_closed(Ptr_val(pub))));
 }
 
 CAMLprim value ml_aeron_excl_publication_is_closed(value pub) {
-    return(Val_bool(aeron_exclusive_publication_is_closed(Excl_publication_val(pub))));
+    return(Val_bool(aeron_exclusive_publication_is_closed(Ptr_val(pub))));
 }
 
 CAMLprim value ml_aeron_publication_is_connected(value pub) {
-    return(Val_bool(aeron_publication_is_connected(Publication_val(pub))));
+    return(Val_bool(aeron_publication_is_connected(Ptr_val(pub))));
 }
 
 CAMLprim value ml_aeron_excl_publication_is_connected(value pub) {
-    return(Val_bool(aeron_exclusive_publication_is_connected(Excl_publication_val(pub))));
+    return(Val_bool(aeron_exclusive_publication_is_connected(Ptr_val(pub))));
 }
 
 CAMLprim value ml_aeron_publication_offer(value pub, value buf, value pos, value len) {
-    int ret = aeron_publication_offer(Publication_val(pub),
+    int ret = aeron_publication_offer(Ptr_val(pub),
                                       Caml_ba_data_val(buf)+Long_val(pos),
                                       Long_val(len), NULL, NULL);
     return(Val_long(ret));
@@ -370,7 +271,7 @@ CAMLprim value ml_aeron_publication_offer(value pub, value buf, value pos, value
    OCaml code. */
 
 CAMLprim value ml_aeron_excl_publication_offer(value pub, value buf, value pos, value len) {
-    int ret = aeron_exclusive_publication_offer(Excl_publication_val(pub),
+    int ret = aeron_exclusive_publication_offer(Ptr_val(pub),
                                                 Caml_ba_data_val(buf)+Long_val(pos),
                                                 Long_val(len), NULL, NULL);
     return(Val_long(ret));
@@ -378,19 +279,16 @@ CAMLprim value ml_aeron_excl_publication_offer(value pub, value buf, value pos, 
 
 CAMLprim value ml_aeron_async_add_subscription (value client, value uri, value stream_id) {
     CAMLparam3(client, uri, stream_id);
-    CAMLlocal1(x);
-    x = caml_alloc_custom(&add_subscription_ops,
-                          sizeof (aeron_async_add_subscription_t **),
-                          0, 1);
-    int ret = aeron_async_add_subscription(&Add_subscription_val(x),
-                                           Client_val(client),
+    aeron_async_add_subscription_t *sub;
+    int ret = aeron_async_add_subscription(&sub,
+                                           Ptr_val(client),
                                            String_val(uri),
                                            Int32_val(stream_id),
                                            NULL, NULL, NULL, NULL);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }
-    CAMLreturn(x);
+    CAMLreturn(Val_ptr(sub));
 }
 
 struct ml_aeron_sub {
@@ -400,7 +298,7 @@ struct ml_aeron_sub {
 
 CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba) {
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
-    int ret = aeron_async_add_subscription_poll(&sub->sub, Add_subscription_val(async));
+    int ret = aeron_async_add_subscription_poll(&sub->sub, Ptr_val(async));
     return Val_int(ret);
 }
 
@@ -459,7 +357,7 @@ CAMLprim value ml_aeron_publication_constants(value pub) {
     CAMLparam1(pub);
     CAMLlocal1(x);
     aeron_publication_constants_t consts;
-    int ret = aeron_publication_constants(Publication_val(pub), &consts);
+    int ret = aeron_publication_constants(Ptr_val(pub), &consts);
     if (ret < 0)
         caml_failwith(aeron_errmsg());
 
@@ -472,7 +370,7 @@ CAMLprim value ml_aeron_excl_publication_constants(value pub) {
     CAMLparam1(pub);
     CAMLlocal1(x);
     aeron_publication_constants_t consts;
-    int ret = aeron_exclusive_publication_constants(Excl_publication_val(pub), &consts);
+    int ret = aeron_exclusive_publication_constants(Ptr_val(pub), &consts);
     if (ret < 0)
       caml_failwith(aeron_errmsg());
 
