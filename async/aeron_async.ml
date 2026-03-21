@@ -63,6 +63,8 @@ type subscription =
   }
 [@@deriving fields]
 
+exception Stopped
+
 type t =
   { ctx : Context.t
   ; ba : Bigstring.t
@@ -77,7 +79,7 @@ type t =
 and pub = P : 'a publication -> pub [@@deriving fields]
 
 let offer t { pub; encode } msg =
-  if Ivar.is_full t.stop then invalid_arg "offer: context closed";
+  if Ivar.is_full t.stop then raise Stopped;
   match pub with
   | Concurrent pub -> ConcurrentPublication.offer pub (encode msg)
   | Exclusive pub -> ExclusivePublication.offer pub (encode msg)
@@ -90,7 +92,7 @@ let close_publication_aux pub =
 ;;
 
 let close_publication t { pub; _ } =
-  if Ivar.is_full t.stop then invalid_arg "close_publication: context closed";
+  if Ivar.is_full t.stop then raise Stopped;
   close_publication_aux pub
 ;;
 
@@ -184,7 +186,7 @@ let is_closed { stop; _ } = Ivar.is_full stop
 let close_finished { stop; _ } = Ivar.read stop
 
 let add_concurrent_publication { client; pubs; stop; _ } chan ~streamID encode =
-  if Ivar.is_full stop then invalid_arg "add_concurrent_publication: context closed";
+  if Ivar.is_full stop then raise Stopped;
   add_concurrent client chan streamID encode
   >>| fun x ->
   let consts = publication_consts x in
@@ -193,7 +195,7 @@ let add_concurrent_publication { client; pubs; stop; _ } chan ~streamID encode =
 ;;
 
 let add_exclusive_publication { client; pubs; stop; _ } chan ~streamID encode =
-  if Ivar.is_full stop then invalid_arg "add_exclusive_publication: context closed";
+  if Ivar.is_full stop then raise Stopped;
   add_exclusive client chan streamID encode
   >>| fun x ->
   let consts = publication_consts x in
@@ -214,9 +216,7 @@ let close_subscription_aux { sub; r } =
 ;;
 
 let close_subscription t x =
-  if Ivar.is_full t.stop
-  then invalid_arg "close_subscription: context closed"
-  else close_subscription_aux x
+  if Ivar.is_full t.stop then raise Stopped else close_subscription_aux x
 ;;
 
 let start_polling_subscription
@@ -295,7 +295,7 @@ let start_polling_subscription
 ;;
 
 let add_subscription ?stop ?period ?max_fragments t uri ~streamID f =
-  if Ivar.is_full t.stop then invalid_arg "add_subscription: context closed";
+  if Ivar.is_full t.stop then raise Stopped;
   Unix.pipe (Info.of_string "Aeron_async.add_subscription")
   >>= function
   | `Reader rfd, `Writer wfd ->
