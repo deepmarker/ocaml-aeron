@@ -6,7 +6,6 @@ open Aeron_async
 let src = Logs.Src.create "aeron.main"
 
 module Lo = (val Logs.src_log src : Logs.LOG)
-module PersistentAeron = Persistent_connection_kernel.Make (Aeron_async)
 
 let cb iobuf =
   (* Iter of iobuf and assert that each byte contains wrapped
@@ -20,22 +19,20 @@ let cb iobuf =
   Lo.app (fun m -> m "(%d bytes payload)" len)
 ;;
 
-let on_error errcode errmsg = Lo.err (fun m -> m "%a: %s" Err.pp errcode errmsg)
-
-let subscribe_direct driver_timeout prefix chan streamID =
-  let conn =
-    PersistentAeron.create
-      ~on_event:(fun evt ->
-        let sexp = PersistentAeron.Event.sexp_of_t String.sexp_of_t evt in
-        Lo.info (fun m -> m "%a" Sexp.pp sexp);
-        Deferred.unit)
-      ~address:(module String)
-      ~server_name:""
-      ~connect:(create ~on_error ?driver_timeout)
-      (fun () -> Deferred.Or_error.return prefix)
-  in
+let subscribe_direct ?driver_timeout prefix chan streamID =
+  create ?driver_timeout prefix
+  >>=? fun (conn, errors) ->
+  don't_wait_for
+    (Pipe.iter_without_pushback errors ~f:(fun err ->
+       Lo.err (fun m -> m "%a" Error.pp err)));
   let terminate = Ivar.create () in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
+  Clock_ns.every
+    ~stop:(Ivar.read terminate)
+    Time_ns.Span.(of_int_ms 10)
+    (fun () ->
+       try Aeron_async.do_work_exn conn with
+       | exn -> Lo.err (fun m -> m "%a" Exn.pp exn));
   let streamID = Int32.of_int_exn streamID in
   let handle client =
     Lo.debug (fun m -> m "start handle");
@@ -48,16 +45,14 @@ let subscribe_direct driver_timeout prefix chan streamID =
   in
   let rec loop () =
     if Ivar.is_full terminate
-    then Deferred.unit
-    else
-      PersistentAeron.connected conn
-      >>= fun client -> handle client >>= fun () -> close client >>= loop
+    then Deferred.Or_error.ok_unit
+    else handle conn >>= fun () -> close conn >>= loop
   in
   loop ()
 ;;
 
 let subscribe =
-  Command.async
+  Command.async_or_error
     ~summary:"Basic subscriber"
     (let open Command.Let_syntax in
      [%map_open
@@ -82,7 +77,7 @@ let subscribe =
            Int.sexp_of_t
            ~default:10
            ~doc:"INT stream-id to use"
-       and timeout =
+       and driver_timeout =
          flag
            "driver-timeout"
            (optional Time_ns_unix.Span.arg_type)
@@ -92,26 +87,24 @@ let subscribe =
        fun () ->
          Logs.set_reporter (Logs_async_reporter.reporter ());
          let chan = Uri.of_string chan in
-         subscribe_direct timeout prefix chan streamID])
+         subscribe_direct ?driver_timeout prefix chan streamID])
 ;;
 
 let publish driver_timeout dir channel streamID sz =
   let channel = Uri.of_string channel in
-  let conn =
-    PersistentAeron.create
-      ~on_event:(fun evt ->
-        let sexp = PersistentAeron.Event.sexp_of_t String.sexp_of_t evt in
-        Lo.info (fun m -> m "%a" Sexp.pp sexp);
-        Deferred.unit)
-      ~address:(module String)
-      ~server_name:""
-      ~connect:(create ~on_error ?driver_timeout)
-      (fun () -> Deferred.Or_error.return dir)
-  in
+  create ?driver_timeout dir
+  >>=? fun (conn, errors) ->
+  don't_wait_for
+    (Pipe.iter_without_pushback errors ~f:(fun err ->
+       Lo.err (fun m -> m "%a" Error.pp err)));
   let terminate = Ivar.create () in
-  let connect () =
-    PersistentAeron.connected conn
-    >>= fun client ->
+  Clock_ns.every
+    ~stop:(Ivar.read terminate)
+    Time_ns.Span.(of_int_ms 10)
+    (fun () ->
+       try Aeron_async.do_work_exn conn with
+       | exn -> Lo.err (fun m -> m "%a" Exn.pp exn));
+  let connect client =
     Lo.info (fun m -> m "Client created");
     let streamID = Int32.of_int_exn streamID in
     Aeron_async.add_exclusive_publication client channel ~streamID Fn.id
@@ -137,14 +130,14 @@ let publish driver_timeout dir channel streamID sz =
     loop pub 0
   in
   let rec loop () =
-    if Ivar.is_full terminate then Deferred.unit else connect () >>= loop
+    if Ivar.is_full terminate then Deferred.Or_error.ok_unit else connect conn >>= loop
   in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
   loop ()
 ;;
 
 let publish =
-  Command.async
+  Command.async_or_error
     ~summary:"Basic subscriber"
     (let open Command.Let_syntax in
      [%map_open

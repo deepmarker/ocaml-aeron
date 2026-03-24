@@ -122,44 +122,51 @@ let close { client; ctx; pubs; stop; subs; _ } =
         Deferred.unit)
 ;;
 
-let start_polling t on_error span =
-  let stop = Ivar.read t.stop in
-  Clock_ns.run_at_intervals ~stop ~continue_on_error:true span (fun () ->
-    match main_do_work t.client with
-    | -1 ->
-      (* Synchronous errors *)
-      on_error (errcode ()) (errmsg ());
-      (* TODO: close only if its fatal. Are all errors fatal? *)
-      don't_wait_for (close t)
-    | _ -> ())
+exception
+  WorkError of
+    { err : Err.t
+    ; msg : string
+    }
+
+let do_work_exn t =
+  match main_do_work t.client with
+  | -1 -> raise (WorkError { err = errcode (); msg = errmsg () })
+  | _ -> ()
 ;;
 
-let process_reader t on_error r =
+let get_error_pipe r =
   let hdr = Bigstring.create 8 in
   let hdrs = Bigsubstring.create hdr in
-  let rec loop () =
-    Reader.really_read_bigsubstring r hdrs
-    >>= function
-    | `Eof _ -> Deferred.unit
-    | `Ok ->
-      let errcode = Bigstring.get_int32_be hdr ~pos:0 |> Err.of_int in
-      let len = Bigstring.get_int32_be hdr ~pos:4 in
-      let bytes = Bytes.create len in
-      let strs = Substring.create bytes in
-      Reader.really_read_substring r strs
-      >>= (function
-       | `Eof _ -> Deferred.unit
-       | `Ok ->
-         on_error errcode (Substring.to_string strs);
-         (* TODO: close only if fatal. *)
-         don't_wait_for (close t);
-         loop ())
+  let on_w w =
+    let rec loop () =
+      Reader.really_read_bigsubstring r hdrs
+      >>= function
+      | `Eof _ -> Deferred.unit
+      | `Ok ->
+        let errcode = Bigstring.get_int32_be hdr ~pos:0 |> Err.of_int in
+        let len = Bigstring.get_int32_be hdr ~pos:4 in
+        let bytes = Bytes.create len in
+        let strs = Substring.create bytes in
+        Reader.really_read_substring r strs
+        >>= (function
+         | `Eof _ ->
+           Pipe.close w;
+           Deferred.unit
+         | `Ok ->
+           let msg = Substring.to_string strs in
+           let err =
+             Error.create_s
+               [%message "AeronError" ~err:(errcode : Err.t) ~msg:(msg : string)]
+           in
+           Pipe.write_if_open w err >>= loop)
+    in
+    loop ()
   in
-  loop ()
+  Pipe.create_reader ~close_on_exception:false on_w
 ;;
 
 (* We set a timeout of one second by default. *)
-let create ?driver_timeout ?(idle = Time_ns.Span.of_int_ms 1) ~on_error dir =
+let create ?driver_timeout dir =
   let nfo = Info.create_s [%message "Aeron_async.create"] in
   Unix.pipe nfo
   >>= fun (`Reader r, `Writer w) ->
@@ -177,9 +184,7 @@ let create ?driver_timeout ?(idle = Time_ns.Span.of_int_ms 1) ~on_error dir =
   let stop = Ivar.create () in
   let subs = Int64.Table.create () in
   let t = Fields.create ~ctx ~ba ~client ~pubs ~stop ~subs in
-  don't_wait_for (process_reader t on_error (Reader.create r));
-  start_polling t on_error idle;
-  t
+  t, get_error_pipe (Reader.create r)
 ;;
 
 let is_closed { stop; _ } = Ivar.is_full stop

@@ -4,16 +4,29 @@ open Aeron
 
 type t
 
+(** [create aeron_dir] returns an aeron handle as well as an error
+    pipe, that must be processed.  *)
 val create
   :  ?driver_timeout:Time_ns.Span.t
-  -> ?idle:Time_ns.Span.t
-  -> on_error:(Err.t -> string -> unit)
   -> string
-  -> t Deferred.Or_error.t
+  -> (t * Error.t Pipe.Reader.t) Deferred.Or_error.t
 
 include Persistent_connection_kernel.Closable with type t := t
 
-(** When the functions below get used with a closed  [t], they will raise an exception. *)
+exception
+  WorkError of
+    { err : Err.t
+    ; msg : string
+    }
+
+(** [do_work_exn t] instructs the Aeron scheduler to perform one unit
+    of work. Can raise [WorkError]. Needs to be called as often as you
+    want the Aeron scheduler to advance (speed-performance
+    tradeoff) *)
+val do_work_exn : t -> unit
+
+(** When the functions below get used with a closed [t], they will
+    raise an exception. *)
 
 (** Subscription *)
 
