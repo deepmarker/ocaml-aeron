@@ -90,7 +90,7 @@ let subscribe =
          subscribe_direct ?driver_timeout prefix chan streamID])
 ;;
 
-let publish driver_timeout dir channel streamID sz =
+let publish driver_timeout dir channel streamID sz direct =
   let channel = Uri.of_string channel in
   create ?driver_timeout dir
   >>=? fun (conn, errors) ->
@@ -104,30 +104,57 @@ let publish driver_timeout dir channel streamID sz =
     (fun () ->
        try Aeron_async.do_work_exn conn with
        | exn -> Lo.err (fun m -> m "%a" Exn.pp exn));
+  let buf = Bigstring.create sz in
+  let msg = Iobuf.of_bigstring buf in
+  for i = 0 to sz - 1 do
+    Iobuf.Fill.int8_trunc msg i
+  done;
   let connect client =
     Lo.info (fun m -> m "Client created");
     let streamID = Int32.of_int_exn streamID in
-    Aeron_async.add_exclusive_publication client channel ~streamID Fn.id
-    >>= fun (pub, consts) ->
-    Lo.info (fun m -> m "Exclusive publication created");
-    Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
-    let buf = Bigstring.create sz in
-    let msg = Iobuf.of_bigstring buf in
-    for i = 0 to sz - 1 do
-      Iobuf.Fill.int8_trunc msg i
-    done;
-    let rec loop pub i =
-      (* Make it ready to consume. *)
-      Iobuf.flip_lo msg;
-      match is_closed client || Ivar.is_full terminate with
-      | true -> Deferred.unit
-      | false ->
-        (match offer client pub buf with
-         | NewStreamPosition x -> Lo.app (fun m -> m "New offset %d" x)
-         | x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferResult.sexp_of_t x)));
-        Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
-    in
-    loop pub 0
+    match direct with
+    | true ->
+      Aeron_async.add_exclusive_publication
+        client
+        channel
+        ~streamID
+        (Aeron_async.direct
+           (fun _ -> sz)
+           (fun aeronbuf mybuf -> Bigstring.blito ~src:mybuf ~dst:aeronbuf ()))
+      >>= fun (pub, consts) ->
+      Lo.info (fun m -> m "Exclusive publication created");
+      Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
+      let rec loop pub i =
+        (* Make it ready to consume. *)
+        match is_closed client || Ivar.is_full terminate with
+        | true -> Deferred.unit
+        | false ->
+          (match offer client pub buf with
+           | Ok ofs -> Lo.app (fun m -> m "New offset %d" ofs)
+           | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferError.sexp_of_t x)));
+          Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
+      in
+      loop pub 0
+    | false ->
+      Aeron_async.add_exclusive_publication
+        client
+        channel
+        ~streamID
+        (Aeron_async.alloc Fn.id)
+      >>= fun (pub, consts) ->
+      Lo.info (fun m -> m "Exclusive publication created");
+      Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
+      let rec loop pub i =
+        (* Make it ready to consume. *)
+        match is_closed client || Ivar.is_full terminate with
+        | true -> Deferred.unit
+        | false ->
+          (match offer client pub buf with
+           | Ok ofs -> Lo.app (fun m -> m "New offset %d" ofs)
+           | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferError.sexp_of_t x)));
+          Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
+      in
+      loop pub 0
   in
   let rec loop () =
     if Ivar.is_full terminate then Deferred.Or_error.ok_unit else connect conn >>= loop
@@ -174,11 +201,12 @@ let publish =
            sexp_of_int
            ~default:10
            ~doc:"INT Size of messages sent"
+       and direct = flag "direct" no_arg ~doc:" Use claim instead of offer"
        and () = Logs_async_reporter.set_level_via_param []
        and () = Logs_async_reporter.set_color_via_param () in
        fun () ->
          Logs.set_reporter (Logs_async_reporter.reporter ());
-         publish timeout prefix chan streamID sz])
+         publish timeout prefix chan streamID sz direct])
 ;;
 
 let cmds =

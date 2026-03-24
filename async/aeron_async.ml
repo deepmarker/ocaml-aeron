@@ -28,15 +28,28 @@ module MkPublication (P : Publication_sig) = struct
   ;;
 
   let offer t ?pos ?len buf = P.offer ?pos ?len t buf
+  let tryclaim = P.tryclaim
   let consts = P.consts
 end
 
 module ConcurrentPublication = MkPublication (Publication)
 module ExclusivePublication = MkPublication (ExclusivePublication)
 
-type 'a publication =
+type ('a, _) encoder =
+  | Alloc : ('a -> Bigstring.t) -> ('a, [ `Alloc ]) encoder
+  | Direct :
+      { claim : claim
+      ; sizer : 'a -> int
+      ; f : Bigstring.t -> 'a -> unit
+      }
+      -> ('a, [ `Direct ]) encoder
+
+let alloc a = Alloc a
+let direct sizer f = Direct { sizer; f; claim = alloc_claim () }
+
+type ('a, 'b) publication =
   { pub : pub_kind
-  ; encode : 'a -> Bigstring.t
+  ; encode : ('a, 'b) encoder
   }
 
 and pub_kind =
@@ -76,13 +89,29 @@ type t =
   ; subs : subscription Int64.Table.t
   }
 
-and pub = P : 'a publication -> pub [@@deriving fields]
+and pub = P : ('a, 'b) publication -> pub [@@deriving fields]
 
-let offer t { pub; encode } msg =
+let handle_direct tryclaim pub sizer f claim msg =
+  let len = sizer msg in
+  match tryclaim pub len claim with
+  | Error err -> Result.fail err
+  | Ok newpos ->
+    let bs = bigstring_of_claim claim in
+    f bs msg;
+    if commit_claim claim <> 0 then failwith "commit claim failed";
+    Result.return newpos
+;;
+
+let offer : type a b. t -> (a, b) publication -> a -> (int, OfferError.t) result =
+  fun t { pub; encode } msg ->
   if Ivar.is_full t.stop then raise Stopped;
-  match pub with
-  | Concurrent pub -> ConcurrentPublication.offer pub (encode msg)
-  | Exclusive pub -> ExclusivePublication.offer pub (encode msg)
+  match pub, encode with
+  | Concurrent pub, Alloc f -> ConcurrentPublication.offer pub (f msg)
+  | Exclusive pub, Alloc f -> ExclusivePublication.offer pub (f msg)
+  | Concurrent pub, Direct { sizer; f; claim } ->
+    handle_direct ConcurrentPublication.tryclaim pub sizer f claim msg
+  | Exclusive pub, Direct { sizer; f; claim } ->
+    handle_direct ExclusivePublication.tryclaim pub sizer f claim msg
 ;;
 
 let close_publication_aux pub =

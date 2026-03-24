@@ -1,3 +1,4 @@
+#include "caml/mlvalues.h"
 #include <endian.h>
 #include <string.h>
 #include <unistd.h>
@@ -416,3 +417,33 @@ CAMLprim value ml_aeron_subscription_poll(value ba, value limit) {
         caml_failwith(aeron_errmsg());
     CAMLreturn(Val_int(nb_read));
 }
+
+CAMLprim value alloc_claim(value unit) {
+  CAMLparam1(unit);
+  CAMLlocal1(claim);
+  claim = caml_alloc(sizeof(aeron_buffer_claim_t), Abstract_tag);
+  CAMLreturn(claim);
+}
+
+CAMLprim value bigstring_of_claim(value claim) {
+  CAMLparam1(claim);
+  CAMLlocal1(ba);
+  aeron_buffer_claim_t *c = Data_abstract_val(claim);
+  ba = caml_ba_alloc_dims(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, c->data, c->length);
+  CAMLreturn(ba);
+}
+
+CAMLprim value ml_aeron_publication_try_claim(value pub, value len, value claim) {
+  int64_t ret = aeron_publication_try_claim(Ptr_val(pub), Long_val(len), Data_abstract_val(claim));
+  return Long_val(ret);
+}
+
+CAMLprim value ml_aeron_excl_publication_try_claim(value pub, value len, value claim) {
+  int64_t ret = aeron_exclusive_publication_try_claim(Ptr_val(pub), Long_val(len), Data_abstract_val(claim));
+  return Long_val(ret);
+}
+
+CAMLprim value ml_aeron_buffer_claim_commit(value claim) {
+    return Val_int(aeron_buffer_claim_commit(Data_abstract_val(claim)));
+}
+

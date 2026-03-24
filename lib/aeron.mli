@@ -1,3 +1,5 @@
+include module type of Aeron_intf
+
 module Err : sig
   type t =
     | Driver_timeout
@@ -25,14 +27,15 @@ module Context : sig
   val get_use_conductor_agent_invoker : t -> bool
 end
 
-type t
-
 val init_exn : Context.t -> t
 val start : t -> unit
 val main_do_work : t -> int
 val errmsg : unit -> string
 val errcode : unit -> Err.t
 val close : t -> unit
+val alloc_claim : unit -> claim
+val bigstring_of_claim : claim -> Bigstringaf.t
+val commit_claim : claim -> int
 
 module Header : sig
   type t =
@@ -80,47 +83,6 @@ module Subscription : sig
 
   val consts : t -> consts
   val poll_exn : t -> int -> int
-end
-
-module OfferResult : sig
-  type t =
-    | NewStreamPosition of int
-    | NotConnected
-    | BackPressured
-    | AdminAction
-    | Closed
-    | MaxPositionExceeded
-    | Error
-  [@@deriving sexp]
-end
-
-type pub_consts =
-  { orig_registration_id : int64
-  ; registration_id : int64
-  ; max_possible_position : int64
-  ; position_bits_to_shift : int64
-  ; term_buffer_length : int64
-  ; max_message_length : int64
-  ; max_payload_length : int64
-  ; stream_id : int32
-  ; session_id : int32
-  ; initial_term_id : int32
-  ; publication_limit_counter_id : int32
-  ; channel_status_indicator_id : int32
-  }
-[@@deriving sexp]
-
-module type Publication_sig = sig
-  type conn = t
-  type add
-  type t
-
-  val add : conn -> Uri.t -> int32 -> add
-  val add_poll : add -> t option
-  val close : t -> unit
-  val is_closed : t -> bool
-  val consts : t -> pub_consts
-  val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> OfferResult.t
 end
 
 module Publication : Publication_sig

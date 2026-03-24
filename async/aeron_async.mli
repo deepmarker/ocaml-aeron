@@ -46,21 +46,26 @@ val close_subscription : t -> subscription -> unit Deferred.t
 
 (** Publication *)
 
-type 'a publication
+type ('a, 'b) encoder
+
+val alloc : ('a -> Bigstring.t) -> ('a, [ `Alloc ]) encoder
+val direct : ('a -> int) -> (Bigstring.t -> 'a -> unit) -> ('a, [ `Direct ]) encoder
+
+type ('a, 'b) publication
 
 val add_concurrent_publication
   :  t
   -> Uri.t
   -> streamID:int32
-  -> ('a -> Bigstring.t)
-  -> ('a publication * pub_consts) Deferred.t
+  -> ('a, 'b) encoder
+  -> (('a, 'b) publication * pub_consts) Deferred.t
 
 val add_exclusive_publication
   :  t
   -> Uri.t
   -> streamID:int32
-  -> ('a -> Bigstring.t)
-  -> ('a publication * pub_consts) Deferred.t
+  -> ('a, 'b) encoder
+  -> (('a, 'b) publication * pub_consts) Deferred.t
 
-val offer : t -> 'a publication -> 'a -> OfferResult.t
-val close_publication : t -> 'a publication -> unit Deferred.t
+val offer : t -> ('a, _) publication -> 'a -> (int, OfferError.t) result
+val close_publication : t -> (_, _) publication -> unit Deferred.t

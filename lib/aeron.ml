@@ -1,4 +1,32 @@
 open Sexplib.Std
+include Aeron_intf
+
+let offer_gen f ?(pos = 0) ?len pub buf =
+  let buflen = Bigstringaf.length buf in
+  let len = Option.value len ~default:buflen in
+  if pos < 0 || len < 0 || pos >= len || len > buflen then invalid_arg "offer";
+  let open OfferError in
+  match f pub buf pos len with
+  | -1 -> Result.error NotConnected
+  | -2 -> Result.error BackPressured
+  | -3 -> Result.error AdminAction
+  | -4 -> Result.error Closed
+  | -5 -> Result.error MaxPositionExceeded
+  | -6 -> Result.error Error
+  | i -> Result.ok i
+;;
+
+let tryclaim_gen f pub len claim =
+  let open OfferError in
+  match f pub len claim with
+  | -1 -> Result.error NotConnected
+  | -2 -> Result.error BackPressured
+  | -3 -> Result.error AdminAction
+  | -4 -> Result.error Closed
+  | -5 -> Result.error MaxPositionExceeded
+  | -6 -> Result.error Error
+  | i -> Result.ok i
+;;
 
 module Err = struct
   type t =
@@ -56,8 +84,6 @@ module Context = struct
     = "ml_aeron_context_get_use_conductor_agent_invoker"
   [@@noalloc]
 end
-
-type t
 
 (* Will block up to driver_timeout_ms if aeronmd is not up (and throw an exn). *)
 external init_exn : Context.t -> t = "ml_aeron_init"
@@ -168,60 +194,9 @@ module Subscription = struct
   external poll_exn : Bigstringaf.t -> int -> int = "ml_aeron_subscription_poll"
 end
 
-module OfferResult = struct
-  type t =
-    | NewStreamPosition of int
-    | NotConnected
-    | BackPressured
-    | AdminAction
-    | Closed
-    | MaxPositionExceeded
-    | Error
-  [@@deriving sexp]
-
-  let offer f ?(pos = 0) ?len pub buf =
-    let buflen = Bigstringaf.length buf in
-    let len = Option.value len ~default:buflen in
-    if pos < 0 || len < 0 || pos >= len || len > buflen then invalid_arg "offer";
-    match f pub buf pos len with
-    | -1 -> NotConnected
-    | -2 -> BackPressured
-    | -3 -> AdminAction
-    | -4 -> Closed
-    | -5 -> MaxPositionExceeded
-    | -6 -> Error
-    | i -> NewStreamPosition i
-  ;;
-end
-
-type pub_consts =
-  { orig_registration_id : int64
-  ; registration_id : int64
-  ; max_possible_position : int64
-  ; position_bits_to_shift : int64
-  ; term_buffer_length : int64
-  ; max_message_length : int64
-  ; max_payload_length : int64
-  ; stream_id : int32
-  ; session_id : int32
-  ; initial_term_id : int32
-  ; publication_limit_counter_id : int32
-  ; channel_status_indicator_id : int32
-  }
-[@@deriving sexp]
-
-module type Publication_sig = sig
-  type conn = t
-  type add
-  type t
-
-  val add : conn -> Uri.t -> int32 -> add
-  val add_poll : add -> t option
-  val close : t -> unit
-  val is_closed : t -> bool
-  val consts : t -> pub_consts
-  val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> OfferResult.t
-end
+external alloc_claim : unit -> claim = "alloc_claim"
+external bigstring_of_claim : claim -> Bigstringaf.t = "bigstring_of_claim"
+external commit_claim : claim -> int = "ml_aeron_buffer_claim_commit" [@@noalloc]
 
 module Publication = struct
   type conn = t
@@ -240,7 +215,11 @@ module Publication = struct
   external offer : t -> Bigstringaf.t -> int -> int -> int = "ml_aeron_publication_offer"
   [@@noalloc]
 
-  let offer = OfferResult.offer offer
+  external tryclaim : t -> int -> claim -> int = "ml_aeron_publication_try_claim"
+  [@@noalloc]
+
+  let offer = offer_gen offer
+  let tryclaim = tryclaim_gen tryclaim
 end
 
 module ExclusivePublication = struct
@@ -266,5 +245,9 @@ module ExclusivePublication = struct
     = "ml_aeron_excl_publication_offer"
   [@@noalloc]
 
-  let offer = OfferResult.offer offer
+  external tryclaim : t -> int -> claim -> int = "ml_aeron_excl_publication_try_claim"
+  [@@noalloc]
+
+  let offer = offer_gen offer
+  let tryclaim = tryclaim_gen tryclaim
 end
