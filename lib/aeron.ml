@@ -4,7 +4,8 @@ include Aeron_intf
 let offer_gen f ?(pos = 0) ?len pub buf =
   let buflen = Bigstringaf.length buf in
   let len = Option.value len ~default:buflen in
-  if pos < 0 || len < 0 || pos >= len || len > buflen then invalid_arg "offer";
+  if pos < 0 || len < 0 || pos >= len || len > buflen
+  then Format.kasprintf invalid_arg "offer: pos=%d len=%d buflen=%d" pos len buflen;
   let open OfferError in
   match f pub buf pos len with
   | -1 -> Result.error NotConnected
@@ -210,6 +211,7 @@ module Publication = struct
 
   external close : t -> unit = "ml_aeron_publication_close"
   external is_closed : t -> bool = "ml_aeron_publication_is_closed" [@@noalloc]
+  external is_connected : t -> bool = "ml_aeron_publication_is_connected" [@@noalloc]
   external consts : t -> pub_consts = "ml_aeron_publication_constants"
 
   external offer : t -> Bigstringaf.t -> int -> int -> int = "ml_aeron_publication_offer"
@@ -234,6 +236,7 @@ module ExclusivePublication = struct
 
   external close : t -> unit = "ml_aeron_excl_publication_close"
   external is_closed : t -> bool = "ml_aeron_excl_publication_is_closed" [@@noalloc]
+  external is_connected : t -> bool = "ml_aeron_excl_publication_is_connected" [@@noalloc]
   external consts : t -> pub_consts = "ml_aeron_excl_publication_constants"
 
   external offer

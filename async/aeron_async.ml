@@ -6,69 +6,142 @@ let src = Logs.Src.create "aeron.async"
 
 module Lo = (val Logs.src_log src : Logs.LOG)
 
-module MkPublication (P : Publication_sig) = struct
+module Encoder = struct
+  type ('a, _) t =
+    | Alloc : ('a -> Bigstring.t) -> ('a, [ `Alloc ]) t
+    | Direct :
+        { claim : claim
+        ; sizer : 'a -> int
+        ; f : Bigstring.t -> 'a -> unit
+        }
+        -> ('a, [ `Direct ]) t
+
+  let alloc a = Alloc a
+  let direct sizer f = Direct { sizer; f; claim = alloc_claim () }
+end
+
+module type S = sig
+  type t
+
+  val add : Aeron.t -> Uri.t -> int32 -> t Deferred.t
+  val is_closed : t -> bool
+  val close_finished : t -> unit Deferred.t
+  val close : t -> unit Deferred.t
+  val offer : t -> ?pos:int -> ?len:int -> Bigstringaf.t -> (int, OfferError.t) result
+  val tryclaim : t -> int -> claim -> (int, OfferError.t) result
+  val consts : t -> pub_consts
+end
+
+module MkAsyncPublication (P : Publication_sig) : S = struct
+  type t =
+    { pub : P.t
+    ; closed : unit Ivar.t
+    }
+
   let add t uri streamID =
     let wait = P.add t uri streamID in
     let rec loop () =
       match P.add_poll wait with
       | None -> Scheduler.yield () >>= loop
-      | Some x -> return x
+      | Some x -> return { pub = x; closed = Ivar.create () }
     in
     loop ()
   ;;
 
-  let close t =
-    P.close t;
-    let rec loop () =
-      match P.is_closed t with
-      | true -> Deferred.unit
-      | false -> Scheduler.yield () >>= loop
-    in
-    loop ()
+  let is_closed { pub; _ } = P.is_closed pub
+  let close_finished { closed; _ } = Ivar.read closed
+
+  (* idempotent. *)
+  let close { pub; closed } =
+    match Ivar.is_full closed with
+    | true -> Deferred.unit
+    | false ->
+      P.close pub;
+      let rec loop () =
+        match P.is_closed pub with
+        | true ->
+          Ivar.fill_if_empty closed ();
+          Deferred.unit
+        | false -> Scheduler.yield () >>= loop
+      in
+      loop ()
   ;;
 
-  let offer t ?pos ?len buf = P.offer ?pos ?len t buf
-  let tryclaim = P.tryclaim
-  let consts = P.consts
+  let offer { pub; closed } ?pos ?len buf =
+    let res = P.offer ?pos ?len pub buf in
+    match res with
+    | Error Closed ->
+      Ivar.fill_if_empty closed ();
+      res
+    | _ -> res
+  ;;
+
+  let tryclaim { pub; closed } i claim =
+    let res = P.tryclaim pub i claim in
+    match res with
+    | Error Closed ->
+      Ivar.fill_if_empty closed ();
+      res
+    | _ -> res
+  ;;
+
+  let consts { pub; _ } = P.consts pub
 end
 
-module ConcurrentPublication = MkPublication (Publication)
-module ExclusivePublication = MkPublication (ExclusivePublication)
+module MkPublication (S : S) = struct
+  module PPub = Persistent_connection_kernel.Make (S)
 
-type ('a, _) encoder =
-  | Alloc : ('a -> Bigstring.t) -> ('a, [ `Alloc ]) encoder
-  | Direct :
-      { claim : claim
-      ; sizer : 'a -> int
-      ; f : Bigstring.t -> 'a -> unit
+  type ('a, 'b) t =
+    { pub : PPub.t
+    ; encode : ('a, 'b) Encoder.t
+    }
+
+  module Address = struct
+    type t =
+      { chan : Uri_sexp.t
+      ; stream_id : int32
       }
-      -> ('a, [ `Direct ]) encoder
+    [@@deriving sexp, compare, equal]
+  end
 
-let alloc a = Alloc a
-let direct sizer f = Direct { sizer; f; claim = alloc_claim () }
+  (* Add a connection. *)
+  let create t chan stream_id encode =
+    let pub =
+      PPub.create
+        ~server_name:""
+        ~address:(module Address)
+        ~connect:(fun { Address.chan; stream_id } ->
+          Monitor.try_with_or_error (fun () -> S.add t chan stream_id))
+        (fun () -> Deferred.Or_error.return { Address.chan; stream_id })
+    in
+    { pub; encode }
+  ;;
 
-type ('a, 'b) publication =
-  { pub : pub_kind
-  ; encode : ('a, 'b) encoder
-  }
+  let consts { pub; _ } = PPub.connected_or_failed_to_connect pub >>|? S.consts
 
-and pub_kind =
-  | Concurrent of Aeron.Publication.t
-  | Exclusive of Aeron.ExclusivePublication.t
+  let offer { pub; _ } ?pos ?len s =
+    PPub.connected_or_failed_to_connect pub >>|? fun x -> S.offer x ?pos ?len s
+  ;;
 
-let add_concurrent t uri streamID encode =
-  ConcurrentPublication.add t uri streamID >>| fun x -> { pub = Concurrent x; encode }
-;;
+  let tryclaim { pub; _ } i claim =
+    PPub.connected_or_failed_to_connect pub >>|? fun x -> S.tryclaim x i claim
+  ;;
 
-let add_exclusive t uri streamID encode =
-  ExclusivePublication.add t uri streamID >>| fun x -> { pub = Exclusive x; encode }
-;;
+  let handle_direct pub sizer f claim msg =
+    let len = sizer msg in
+    tryclaim pub len claim
+    >>|? function
+    | Error err -> Result.fail err
+    | Ok newpos ->
+      let bs = bigstring_of_claim claim in
+      f bs msg;
+      if commit_claim claim <> 0 then failwith "commit claim failed";
+      Result.return newpos
+  ;;
+end
 
-let publication_consts { pub; _ } =
-  match pub with
-  | Concurrent x -> ConcurrentPublication.consts x
-  | Exclusive x -> ExclusivePublication.consts x
-;;
+module Concurrent = MkPublication (MkAsyncPublication (Publication))
+module Exclusive = MkPublication (MkAsyncPublication (ExclusivePublication))
 
 type subscription =
   { sub : Subscription.t
@@ -77,6 +150,15 @@ type subscription =
 [@@deriving fields]
 
 exception Stopped
+
+type ('a, 'b) publication =
+  | Concurrent of ('a, 'b) Concurrent.t
+  | Exclusive of ('a, 'b) Exclusive.t
+
+let close_publication = function
+  | Concurrent { pub; _ } -> Concurrent.PPub.close pub
+  | Exclusive { pub; _ } -> Exclusive.PPub.close pub
+;;
 
 type t =
   { ctx : Context.t
@@ -91,38 +173,19 @@ type t =
 
 and pub = P : ('a, 'b) publication -> pub [@@deriving fields]
 
-let handle_direct tryclaim pub sizer f claim msg =
-  let len = sizer msg in
-  match tryclaim pub len claim with
-  | Error err -> Result.fail err
-  | Ok newpos ->
-    let bs = bigstring_of_claim claim in
-    f bs msg;
-    if commit_claim claim <> 0 then failwith "commit claim failed";
-    Result.return newpos
-;;
-
-let offer : type a b. t -> (a, b) publication -> a -> (int, OfferError.t) result =
-  fun t { pub; encode } msg ->
+let offer
+  : type a b.
+    t -> (a, b) publication -> a -> (int, OfferError.t) result Deferred.Or_error.t
+  =
+  fun t pub msg ->
   if Ivar.is_full t.stop then raise Stopped;
-  match pub, encode with
-  | Concurrent pub, Alloc f -> ConcurrentPublication.offer pub (f msg)
-  | Exclusive pub, Alloc f -> ExclusivePublication.offer pub (f msg)
-  | Concurrent pub, Direct { sizer; f; claim } ->
-    handle_direct ConcurrentPublication.tryclaim pub sizer f claim msg
-  | Exclusive pub, Direct { sizer; f; claim } ->
-    handle_direct ExclusivePublication.tryclaim pub sizer f claim msg
-;;
-
-let close_publication_aux pub =
   match pub with
-  | Concurrent x -> ConcurrentPublication.close x
-  | Exclusive x -> ExclusivePublication.close x
-;;
-
-let close_publication t { pub; _ } =
-  if Ivar.is_full t.stop then raise Stopped;
-  close_publication_aux pub
+  | Concurrent ({ encode = Alloc f; _ } as pub) -> Concurrent.offer pub (f msg)
+  | Concurrent ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
+    Concurrent.handle_direct pub sizer f claim msg
+  | Exclusive ({ encode = Alloc f; _ } as pub) -> Exclusive.offer pub (f msg)
+  | Exclusive ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
+    Exclusive.handle_direct pub sizer f claim msg
 ;;
 
 let close { client; ctx; pubs; stop; subs; _ } =
@@ -141,8 +204,10 @@ let close { client; ctx; pubs; stop; subs; _ } =
       (fun () ->
          Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, { r; _ }) -> Reader.close r)
          >>= fun () ->
-         Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P { pub; _ }) ->
-           close_publication_aux pub))
+         Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P x) ->
+           match x with
+           | Concurrent { pub; _ } -> Concurrent.PPub.close pub
+           | Exclusive { pub; _ } -> Exclusive.PPub.close pub))
       ~finally:(fun () ->
         (* stop polling *)
         Lo.debug (fun m -> m "closing (freeing) aeron client C structures");
@@ -221,20 +286,20 @@ let close_finished { stop; _ } = Ivar.read stop
 
 let add_concurrent_publication { client; pubs; stop; _ } chan ~streamID encode =
   if Ivar.is_full stop then raise Stopped;
-  add_concurrent client chan streamID encode
-  >>| fun x ->
-  let consts = publication_consts x in
-  Hashtbl.set pubs ~key:consts.registration_id ~data:(P x);
-  x, consts
+  let x = Concurrent.create client chan streamID encode in
+  Concurrent.consts x
+  >>|? fun consts ->
+  Hashtbl.set pubs ~key:consts.registration_id ~data:(P (Concurrent x));
+  Concurrent x, consts
 ;;
 
 let add_exclusive_publication { client; pubs; stop; _ } chan ~streamID encode =
   if Ivar.is_full stop then raise Stopped;
-  add_exclusive client chan streamID encode
-  >>| fun x ->
-  let consts = publication_consts x in
-  Hashtbl.set pubs ~key:consts.registration_id ~data:(P x);
-  x, consts
+  let x = Exclusive.create client chan streamID encode in
+  Exclusive.consts x
+  >>|? fun consts ->
+  Hashtbl.set pubs ~key:consts.registration_id ~data:(P (Exclusive x));
+  Exclusive x, consts
 ;;
 
 let close_subscription_aux { sub; r } =

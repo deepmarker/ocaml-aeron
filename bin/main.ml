@@ -118,20 +118,22 @@ let publish driver_timeout dir channel streamID sz direct =
         client
         channel
         ~streamID
-        (Aeron_async.direct
+        (Aeron_async.Encoder.direct
            (fun _ -> sz)
            (fun aeronbuf mybuf -> Bigstring.blito ~src:mybuf ~dst:aeronbuf ()))
-      >>= fun (pub, consts) ->
+      >>=? fun (pub, consts) ->
       Lo.info (fun m -> m "Exclusive publication created");
       Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
       let rec loop pub i =
         (* Make it ready to consume. *)
         match is_closed client || Ivar.is_full terminate with
-        | true -> Deferred.unit
+        | true -> Deferred.Or_error.ok_unit
         | false ->
-          (match offer client pub buf with
+          offer client pub buf
+          >>|? (function
            | Ok ofs -> Lo.app (fun m -> m "New offset %d" ofs)
-           | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferError.sexp_of_t x)));
+           | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferError.sexp_of_t x)))
+          >>=? fun () ->
           Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
       in
       loop pub 0
@@ -140,24 +142,26 @@ let publish driver_timeout dir channel streamID sz direct =
         client
         channel
         ~streamID
-        (Aeron_async.alloc Fn.id)
-      >>= fun (pub, consts) ->
+        (Aeron_async.Encoder.alloc Fn.id)
+      >>=? fun (pub, consts) ->
       Lo.info (fun m -> m "Exclusive publication created");
       Lo.info (fun m -> m "%a" Sexp.pp (Aeron.sexp_of_pub_consts consts));
       let rec loop pub i =
         (* Make it ready to consume. *)
         match is_closed client || Ivar.is_full terminate with
-        | true -> Deferred.unit
+        | true -> Deferred.Or_error.ok_unit
         | false ->
-          (match offer client pub buf with
+          offer client pub buf
+          >>|? (function
            | Ok ofs -> Lo.app (fun m -> m "New offset %d" ofs)
-           | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferError.sexp_of_t x)));
+           | Error x -> Lo.err (fun m -> m "%a" Sexp.pp (Aeron.OfferError.sexp_of_t x)))
+          >>=? fun () ->
           Clock_ns.after (Time_ns.Span.of_int_sec 1) >>= fun () -> loop pub (succ i)
       in
       loop pub 0
   in
   let rec loop () =
-    if Ivar.is_full terminate then Deferred.Or_error.ok_unit else connect conn >>= loop
+    if Ivar.is_full terminate then Deferred.Or_error.ok_unit else connect conn >>=? loop
   in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
   loop ()

@@ -40,6 +40,7 @@ module type Publication_sig = sig
   val add_poll : add -> t option
   val close : t -> unit
   val is_closed : t -> bool
+  val is_connected : t -> bool
   val consts : t -> pub_consts
   val offer : ?pos:int -> ?len:int -> t -> Bigstringaf.t -> (int, OfferError.t) result
   val tryclaim : t -> int -> claim -> (int, OfferError.t) result
