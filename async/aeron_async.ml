@@ -249,8 +249,7 @@ let get_error_pipe r =
          | `Ok ->
            let msg = Substring.to_string strs in
            let err =
-             Error.create_s
-               [%message "AeronError" ~err:(errcode : Err.t) ~msg:(msg : string)]
+             Error.create_s [%message "AeronError" ~err:(errcode : Err.t) ~(msg : string)]
            in
            Pipe.write_if_open w err >>= loop)
     in
