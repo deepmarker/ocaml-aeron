@@ -20,10 +20,49 @@ module Encoder = struct
   let direct sizer f = Direct { sizer; f; claim = alloc_claim () }
 end
 
+(* Aeron's add and close are asynchronous at the driver: the call hands
+   back a token, and the operation only completes once the media driver has
+   acted on it. When the driver stops acting -- it drops its clients across
+   a machine suspend, leaving "client timeout from driver" behind -- the
+   token never resolves.
+
+   Polling for that without a deadline turns into an unbounded wait in every
+   caller. Worse, it defeats the point of wrapping a publication in a
+   [Persistent_connection]: that machinery reconnects and backs off on the
+   strength of connect attempts that *fail*, and an attempt that can only
+   succeed or hang gives it nothing to act on, so [connected_or_failed_to_connect]
+   never reports a failure and every [offer] behind it waits forever.
+
+   Polling on a timer rather than [Scheduler.yield] also matters: yielding
+   re-runs the loop every scheduler cycle, so an operation that never
+   completes spins as fast as Async will let it. *)
+let poll_period = Time_ns.Span.of_int_ms 1
+let default_op_timeout = Time_ns.Span.of_int_sec 5
+
+let poll_until ?(timeout = default_op_timeout) ~what f =
+  let deadline = Time_ns.add (Time_ns.now ()) timeout in
+  let rec loop () =
+    match f () with
+    | Some x -> Deferred.Or_error.return x
+    | None when Time_ns.( > ) (Time_ns.now ()) deadline ->
+      Deferred.Or_error.error_s
+        [%message
+          "aeron: operation did not complete in time; media driver unresponsive?"
+            ~(what : string)
+            ~(timeout : Time_ns.Span.t)]
+    | None -> Clock_ns.after poll_period >>= loop
+  in
+  loop ()
+;;
+
 module type S = sig
   type t
 
-  val add : Aeron.t -> Uri.t -> int32 -> t Deferred.t
+  (** Bounded: reports an error rather than waiting on a driver that has
+      stopped answering, so that a persistent connection can see the attempt
+      fail, back off and retry. *)
+  val add : Aeron.t -> Uri.t -> int32 -> t Deferred.Or_error.t
+
   val is_closed : t -> bool
   val close_finished : t -> unit Deferred.t
   val close : t -> unit Deferred.t
@@ -40,12 +79,8 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
 
   let add t uri streamID =
     let wait = P.add t uri streamID in
-    let rec loop () =
-      match P.add_poll wait with
-      | None -> Scheduler.yield () >>= loop
-      | Some x -> return { pub = x; closed = Ivar.create () }
-    in
-    loop ()
+    poll_until ~what:"add publication" (fun () -> P.add_poll wait)
+    >>|? fun pub -> { pub; closed = Ivar.create () }
   ;;
 
   let is_closed { pub; _ } = P.is_closed pub
@@ -57,14 +92,14 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
     | true -> Deferred.unit
     | false ->
       P.close pub;
-      let rec loop () =
-        match P.is_closed pub with
-        | true ->
-          Ivar.fill_if_empty closed ();
-          Deferred.unit
-        | false -> Scheduler.yield () >>= loop
-      in
-      loop ()
+      poll_until ~what:"close publication" (fun () -> Option.some_if (P.is_closed pub) ())
+      >>| fun res ->
+      (* The driver has been told to close either way; refusing to give up
+         here would only hang shutdown. *)
+      (match res with
+       | Ok () -> ()
+       | Error err -> Lo.err (fun m -> m "%a" Error.pp err));
+      Ivar.fill_if_empty closed ()
   ;;
 
   let offer { pub; closed } ?pos ?len buf =
@@ -111,7 +146,7 @@ module MkPublication (S : S) = struct
         ~server_name:""
         ~address:(module Address)
         ~connect:(fun { Address.chan; stream_id } ->
-          Monitor.try_with_or_error (fun () -> S.add t chan stream_id))
+          Monitor.try_with_or_error (fun () -> S.add t chan stream_id) >>| Or_error.join)
         (fun () -> Deferred.Or_error.return { Address.chan; stream_id })
     in
     { pub; encode }
@@ -303,14 +338,14 @@ let add_exclusive_publication { client; pubs; stop; _ } chan ~streamID encode =
 
 let close_subscription_aux { sub; r } =
   Subscription.close sub;
-  let rec loop () =
-    match Subscription.is_closed sub with
-    | true ->
-      (* cleanup *)
-      Reader.close r
-    | false -> Scheduler.yield () >>= loop
-  in
-  loop ()
+  poll_until ~what:"close subscription" (fun () ->
+    Option.some_if (Subscription.is_closed sub) ())
+  >>= fun res ->
+  (match res with
+   | Ok () -> ()
+   | Error err -> Lo.err (fun m -> m "%a" Error.pp err));
+  (* cleanup regardless: the reader is ours to close. *)
+  Reader.close r
 ;;
 
 let close_subscription t x =

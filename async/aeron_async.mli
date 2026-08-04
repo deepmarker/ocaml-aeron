@@ -4,6 +4,21 @@ open Aeron
 
 type t
 
+(** [poll_until ~what f] polls [f] on a timer until it yields a value, and
+    gives up with an error once [timeout] has passed.
+
+    Aeron's add and close complete asynchronously at the media driver, so
+    they have to be polled. A driver that has stopped answering -- it drops
+    its clients across a machine suspend -- would otherwise be polled
+    forever, which becomes an unbounded wait in every caller and leaves a
+    persistent connection with no failed attempt to retry from. Exposed so
+    that behaviour can be tested without a live driver. *)
+val poll_until
+  :  ?timeout:Time_ns.Span.t
+  -> what:string
+  -> (unit -> 'a option)
+  -> 'a Deferred.Or_error.t
+
 (** [create aeron_dir] returns an aeron handle as well as an error
     pipe, that must be processed.  *)
 val create

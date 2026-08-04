@@ -1,4 +1,11 @@
 (test
  (name aeron)
- (libraries aeron)
-)
+ (modules aeron)
+ (libraries aeron))
+
+(test
+ (name aeron_async_test)
+ (modules aeron_async_test)
+ (preprocess
+  (pps ppx_jane))
+ (libraries core async aeron_async alcotest alcotest-async))
