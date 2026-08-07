@@ -1,11 +1,10 @@
 (library
  (public_name aeron)
- (foreign_stubs (language c) (names aeron_stubs) (flags :standard -Wall -Werror))
+ (foreign_stubs
+  (language c)
+  (names aeron_stubs)
+  (flags :standard -Wall -Werror))
  (c_library_flags (-laeron))
- (preprocess (pps ppx_sexp_conv ppx_cstruct))
- (libraries
-   unix
-   uri
-   sexplib
-   bigstringaf
-))
+ (preprocess
+  (pps ppx_sexp_conv ppx_cstruct))
+ (libraries unix uri sexplib bigstringaf))
