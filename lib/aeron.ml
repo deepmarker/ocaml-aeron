@@ -38,11 +38,21 @@ module Err = struct
     | Unknown of int
   [@@deriving sexp]
 
+  (* Two entry points disagree on sign for the same codes against the
+     installed aeron 1.52 client: [aeron_errcode ()] (behind [errcode ()]
+     below, what [do_work_exn] raises with) has been observed negative
+     (-1000 etc, matching the aeron source tree's #define), while the
+     [aeron_error_handler_t] callback (behind [Aeron_async]'s error pipe)
+     was observed delivering the same codes positive (1000 etc, matching
+     /usr/include/aeron/aeronc.h on this system) -- confirmed by driving an
+     actual driver-timeout against a real media driver, not by reading
+     either header. Accept both so a client-fatal error is recognized
+     regardless of which path reported it. *)
   let of_int = function
-    | -1000 -> Driver_timeout
-    | -1001 -> Client_timeout
-    | -1002 -> Conductor_service_timeout
-    | -1003 -> Buffer_full
+    | -1000 | 1000 -> Driver_timeout
+    | -1001 | 1001 -> Client_timeout
+    | -1002 | 1002 -> Conductor_service_timeout
+    | -1003 | 1003 -> Buffer_full
     | i -> Unknown i
   ;;
 

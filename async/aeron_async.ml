@@ -69,6 +69,16 @@ module type S = sig
   val offer : t -> ?pos:int -> ?len:int -> Bigstringaf.t -> (int, OfferError.t) result
   val tryclaim : t -> int -> claim -> (int, OfferError.t) result
   val consts : t -> pub_consts
+
+  (** Marks [t] closed without touching the underlying C object, unlike
+      [close]. For when the client this publication was added through has
+      already died and force-closed everything it owns: there is nothing
+      left to ask the driver to close, and doing so anyway risks operating
+      on a publication the dead client's conductor may already be tearing
+      down. This is the only way [connected_or_failed_to_connect] finds out
+      to reconnect when nothing else calls [offer]/[tryclaim] in the
+      meantime to notice on its own (see [Persistent.Client]). *)
+  val invalidate : t -> unit
 end
 
 module MkAsyncPublication (P : Publication_sig) : S = struct
@@ -85,6 +95,7 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
 
   let is_closed { pub; _ } = P.is_closed pub
   let close_finished { closed; _ } = Ivar.read closed
+  let invalidate { closed; _ } = Ivar.fill_if_empty closed ()
 
   (* idempotent. *)
   let close { pub; closed } =
@@ -139,14 +150,35 @@ module MkPublication (S : S) = struct
     [@@deriving sexp, compare, equal]
   end
 
-  (* Add a connection. *)
-  let create t chan stream_id encode =
+  (* Add a connection. [get_client] is consulted on every (re)connect
+     attempt rather than once up front, so a publication added on top of a
+     [Persistent.Client.t] follows that client across a reconnect instead of
+     retrying [S.add] forever against a client whose conductor is dead.
+
+     [get_client] also hands back that client's own death signal, which
+     [invalidate]s the publication once it fires. Without this, a
+     publication that never needed to notice a failure on its own (because
+     nothing called [offer]/[tryclaim] between the client dying and coming
+     back) would wait forever: [connected_or_failed_to_connect] won't hand
+     out a connection it already sees as closed, but nothing ever prompts a
+     reconnect either, since that only happens once *this* wrapper's own
+     [close_finished] fires -- which, absent this hook, only [offer]
+     noticing [Error Closed] can do. Confirmed live: without it, a
+     publication added before a driver restart never reconnects, no matter
+     how many offers are retried against it afterwards. *)
+  let create ~get_client chan stream_id encode =
     let pub =
       PPub.create
         ~server_name:""
         ~address:(module Address)
         ~connect:(fun { Address.chan; stream_id } ->
-          Monitor.try_with_or_error (fun () -> S.add t chan stream_id) >>| Or_error.join)
+          get_client ()
+          >>=? fun (client, client_dead) ->
+          Monitor.try_with_or_error (fun () -> S.add client chan stream_id)
+          >>| Or_error.join
+          >>|? fun x ->
+          don't_wait_for (client_dead >>| fun () -> S.invalidate x);
+          x)
         (fun () -> Deferred.Or_error.return { Address.chan; stream_id })
     in
     { pub; encode }
@@ -208,12 +240,17 @@ type t =
 
 and pub = P : ('a, 'b) publication -> pub [@@deriving fields]
 
-let offer
-  : type a b.
-    t -> (a, b) publication -> a -> (int, OfferError.t) result Deferred.Or_error.t
+(* The actual dispatch does not need a client: [Concurrent.offer] /
+   [Exclusive.offer] already go through the publication's own persistent
+   connection ([PPub.connected_or_failed_to_connect]), which reports a dead
+   connection as an [Error] rather than needing a specific [t] to ask. Shared
+   by the raw [offer] below (which additionally checks that its owning
+   client hasn't been explicitly stopped) and by [Persistent.offer] (whose
+   publications aren't tied to a single client). *)
+let offer_pub
+  : type a b. (a, b) publication -> a -> (int, OfferError.t) result Deferred.Or_error.t
   =
-  fun t pub msg ->
-  if Ivar.is_full t.stop then raise Stopped;
+  fun pub msg ->
   match pub with
   | Concurrent ({ encode = Alloc f; _ } as pub) -> Concurrent.offer pub (f msg)
   | Concurrent ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
@@ -221,6 +258,15 @@ let offer
   | Exclusive ({ encode = Alloc f; _ } as pub) -> Exclusive.offer pub (f msg)
   | Exclusive ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
     Exclusive.handle_direct pub sizer f claim msg
+;;
+
+let offer
+  : type a b.
+    t -> (a, b) publication -> a -> (int, OfferError.t) result Deferred.Or_error.t
+  =
+  fun t pub msg ->
+  if Ivar.is_full t.stop then raise Stopped;
+  offer_pub pub msg
 ;;
 
 let close { client; ctx; pubs; stop; subs; _ } =
@@ -286,7 +332,7 @@ let get_error_pipe r =
            let err =
              Error.create_s [%message "AeronError" ~err:(errcode : Err.t) ~(msg : string)]
            in
-           Pipe.write_if_open w err >>= loop)
+           Pipe.write_if_open w (errcode, err) >>= loop)
     in
     loop ()
   in
@@ -318,18 +364,20 @@ let create ?driver_timeout dir =
 let is_closed { stop; _ } = Ivar.is_full stop
 let close_finished { stop; _ } = Ivar.read stop
 
-let add_concurrent_publication { client; pubs; stop; _ } chan ~streamID encode =
+let add_concurrent_publication ({ client; pubs; stop; _ } as t) chan ~streamID encode =
   if Ivar.is_full stop then raise Stopped;
-  let x = Concurrent.create client chan streamID encode in
+  let get_client () = Deferred.Or_error.return (client, close_finished t) in
+  let x = Concurrent.create ~get_client chan streamID encode in
   Concurrent.consts x
   >>|? fun consts ->
   Hashtbl.set pubs ~key:consts.registration_id ~data:(P (Concurrent x));
   Concurrent x, consts
 ;;
 
-let add_exclusive_publication { client; pubs; stop; _ } chan ~streamID encode =
+let add_exclusive_publication ({ client; pubs; stop; _ } as t) chan ~streamID encode =
   if Ivar.is_full stop then raise Stopped;
-  let x = Exclusive.create client chan streamID encode in
+  let get_client () = Deferred.Or_error.return (client, close_finished t) in
+  let x = Exclusive.create ~get_client chan streamID encode in
   Exclusive.consts x
   >>|? fun consts ->
   Hashtbl.set pubs ~key:consts.registration_id ~data:(P (Exclusive x));
@@ -356,6 +404,7 @@ let start_polling_subscription
       ?(stop = Deferred.never ())
       ?(period = Time_ns.Span.of_int_ms 1)
       ?(max_fragments = 10)
+      ?(on_fatal = ignore)
       (sub : subscription)
       f
   =
@@ -375,6 +424,10 @@ let start_polling_subscription
          match Aeron.Subscription.poll_exn sub.sub max_fragments with
          | exception exn ->
            Lo.err (fun m -> m "%s" (Exn.to_string exn));
+           (* Let the caller know this subscription is dead beyond this
+              point -- e.g. so a [Persistent] subscription notices and
+              re-subscribes -- before tearing it down. *)
+           on_fatal exn;
            Lazy.force close_sub
          | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
          | _ -> Clock_ns.after period >>= loop)
@@ -427,23 +480,208 @@ let start_polling_subscription
   loop ()
 ;;
 
-let add_subscription ?stop ?period ?max_fragments t uri ~streamID f =
+let add_subscription ?stop ?period ?max_fragments ?on_fatal t uri ~streamID f =
   if Ivar.is_full t.stop then raise Stopped;
   Unix.pipe (Info.of_string "Aeron_async.add_subscription")
+  >>= fun (`Reader rfd, `Writer wfd) ->
+  let sub_req = Aeron.Subscription.add t.client uri streamID in
+  let wfd_raw = Fd.to_int_exn wfd in
+  (* Bounded for the same reason publication's [add] is (see [poll_until]):
+     a driver that has stopped answering must not turn this into an
+     unbounded wait. *)
+  poll_until ~what:"add subscription" (fun () ->
+    Aeron.Subscription.add_poll sub_req wfd_raw)
   >>= function
-  | `Reader rfd, `Writer wfd ->
-    let sub_req = Aeron.Subscription.add t.client uri streamID in
-    let wfd_raw = Fd.to_int_exn wfd in
-    let rec loop () =
-      match Aeron.Subscription.add_poll sub_req wfd_raw with
-      | None -> Scheduler.yield () >>= loop
-      | Some sub ->
-        let consts = Subscription.consts sub in
-        let r = Reader.create rfd in
-        let sub = Fields_of_subscription.create ~sub ~r in
-        Hashtbl.set t.subs ~key:consts.registration_id ~data:sub;
-        don't_wait_for (start_polling_subscription ?stop ?period ?max_fragments sub f);
-        return (sub, consts)
-    in
-    loop ()
+  | Error _ as e -> Fd.close rfd >>= fun () -> Fd.close wfd >>| fun () -> e
+  | Ok sub ->
+    let consts = Subscription.consts sub in
+    let r = Reader.create rfd in
+    let sub = Fields_of_subscription.create ~sub ~r in
+    Hashtbl.set t.subs ~key:consts.registration_id ~data:sub;
+    don't_wait_for
+      (start_polling_subscription ?stop ?period ?max_fragments ?on_fatal sub f);
+    Deferred.Or_error.return (sub, consts)
 ;;
+
+(* Auto-reconnecting layer, for producers/consumers that must survive the
+   media driver disappearing out from under them -- e.g. across a host
+   suspend, which the driver and the client both see as a timeout. When
+   [do_work_exn] raises [WorkError], the client's conductor is dead for
+   good: nothing in the C client can recover from a driver/client/conductor
+   timeout, the only fix is to build a brand new client. [Client] does that
+   by wrapping the raw client in a [Persistent_connection_kernel] connection
+   -- the same combinator [MkPublication] above already uses for
+   publications -- and [add_*_publication] / [add_subscription] below add
+   themselves against whichever client is currently connected, so a
+   client-level reconnect forces them to re-add against the new one instead
+   of retrying forever against a client whose conductor is dead. *)
+module Persistent = struct
+  (* Captured before [Client] shadows [create] with the persistent-connection
+     constructor of the same name. *)
+  let raw_create = create
+
+  module Client = struct
+    module Conn = struct
+      type nonrec t = t
+
+      let close = close
+      let is_closed = is_closed
+      let close_finished = close_finished
+    end
+
+    module M = Persistent_connection_kernel.Make (Conn)
+    include M
+
+    module Address = struct
+      type t = string [@@deriving sexp_of, equal]
+    end
+
+    let create ?driver_timeout ?(do_work_period = Time_ns.Span.of_int_ms 1) dir =
+      let connect dir =
+        Lo.info (fun m -> m "aeron: connecting client at %s" dir);
+        raw_create ?driver_timeout dir
+        >>|? fun (conn, errors) ->
+        Lo.info (fun m -> m "aeron: client connected");
+        don't_wait_for
+          (Pipe.iter_without_pushback errors ~f:(fun (errcode, err) ->
+             Lo.err (fun m -> m "%a" Error.pp err);
+             match errcode with
+             | Err.Driver_timeout | Client_timeout | Conductor_service_timeout ->
+               (* Confirmed against a real driver: a driver/client/conductor
+                  timeout reaches us here, not through [do_work_exn] --
+                  the C client's own timeout check sets an internal
+                  "terminating" flag and its work loop goes quiet (returns
+                  0, not -1) from then on, so [do_work_exn] never raises for
+                  this. This error pipe is the only place these show up. *)
+               Lo.err (fun m -> m "aeron: client fault, rebuilding client");
+               don't_wait_for (Conn.close conn)
+             | Buffer_full | Unknown _ -> ()));
+        Clock_ns.every' ~stop:(Conn.close_finished conn) do_work_period (fun () ->
+          match Result.try_with (fun () -> do_work_exn conn) with
+          | Ok () -> Deferred.unit
+          | Error exn ->
+            Lo.err (fun m -> m "aeron: client fault, rebuilding client: %a" Exn.pp exn);
+            Conn.close conn);
+        conn
+      in
+      M.create
+        ~server_name:"aeron"
+        ~connect
+        ~address:(module Address)
+        (fun () -> Deferred.Or_error.return dir)
+    ;;
+
+    (* The raw client handle publications/subscriptions actually register
+       against, once (re)connected, paired with that specific client's own
+       death signal (see [MkPublication.create]'s comment on [invalidate]).
+       Waits across a reconnect in progress rather than surfacing the
+       previous client's death as a caller-visible error, since a fresh add
+       is exactly what should happen next. *)
+    let raw_client t =
+      M.connected_or_failed_to_connect t
+      >>|? fun (conn : Conn.t) -> conn.client, Conn.close_finished conn
+    ;;
+  end
+
+  (* Publications: reuse [Concurrent] / [Exclusive] / [offer_pub] wholesale
+     -- a persistent publication is just one whose [get_client] asks a
+     [Client.t] on every reconnect attempt instead of returning a fixed
+     [Aeron.t]. *)
+
+  let add_concurrent_publication (client : Client.t) chan ~streamID encode =
+    let get_client () = Client.raw_client client in
+    let x = Concurrent.create ~get_client chan streamID encode in
+    Concurrent.consts x >>|? fun consts -> Concurrent x, consts
+  ;;
+
+  let add_exclusive_publication (client : Client.t) chan ~streamID encode =
+    let get_client () = Client.raw_client client in
+    let x = Exclusive.create ~get_client chan streamID encode in
+    Exclusive.consts x >>|? fun consts -> Exclusive x, consts
+  ;;
+
+  let offer = offer_pub
+
+  (* Subscriptions: no [S]-shaped module exists for these upstream, so wrap
+     them the same way [MkPublication] wraps publications: a small
+     [Closable] around [subscription] plus an explicit "this is dead" ivar,
+     filled either by [add_subscription]'s poll loop hitting a fatal error
+     or by the owning client dying, then handed to
+     [Persistent_connection_kernel] for the actual reconnect/backoff. *)
+  module Subscription = struct
+    module Conn = struct
+      type t =
+        { sub : subscription
+        ; closed : unit Ivar.t
+        }
+
+      let close { sub; closed } =
+        if Ivar.is_full closed
+        then Deferred.unit
+        else (
+          Ivar.fill_if_empty closed ();
+          close_subscription_aux sub)
+      ;;
+
+      let is_closed { closed; _ } = Ivar.is_full closed
+      let close_finished { closed; _ } = Ivar.read closed
+    end
+
+    module M = Persistent_connection_kernel.Make (Conn)
+    include M
+
+    module Address = struct
+      type t =
+        { chan : Uri_sexp.t
+        ; stream_id : int32
+        }
+      [@@deriving sexp, compare, equal]
+    end
+
+    let create ?period ?max_fragments (client : Client.t) chan stream_id f =
+      M.create
+        ~server_name:""
+        ~address:(module Address)
+        ~connect:(fun { Address.chan; stream_id } ->
+          (* [add_subscription] wants the [Aeron_async.t] wrapper (it needs
+             [.client], [.stop] and [.subs]), unlike publications which add
+             directly against the raw [Aeron.t] handle. *)
+          Client.connected_or_failed_to_connect client
+          >>=? fun raw ->
+          Monitor.try_with_or_error (fun () ->
+            let closed = Ivar.create () in
+            add_subscription
+              ?period
+              ?max_fragments
+              ~on_fatal:(fun _exn -> Ivar.fill_if_empty closed ())
+              raw
+              chan
+              ~streamID:stream_id
+              f
+            >>|? fun (sub, _consts) ->
+            (* The client dying takes every subscription registered
+               through it down with it; notice immediately instead of
+               waiting for the next poll tick or a fragment that never
+               comes. *)
+            don't_wait_for
+              (Client.Conn.close_finished raw >>| fun () -> Ivar.fill_if_empty closed ());
+            { Conn.sub; closed })
+          >>| Or_error.join)
+        (fun () -> Deferred.Or_error.return { Address.chan; stream_id })
+    ;;
+
+    let consts t =
+      M.connected_or_failed_to_connect t
+      >>|? fun { Conn.sub; _ } -> Aeron.Subscription.consts sub.sub
+    ;;
+  end
+
+  type subscription = Subscription.t
+
+  let add_subscription ?period ?max_fragments client chan ~streamID f =
+    let sub = Subscription.create ?period ?max_fragments client chan streamID f in
+    Subscription.consts sub >>|? fun consts -> sub, consts
+  ;;
+
+  let close_subscription (sub : subscription) = Subscription.close sub
+end

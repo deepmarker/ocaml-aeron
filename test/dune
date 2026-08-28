@@ -9,3 +9,13 @@
  (preprocess
   (pps ppx_jane))
  (libraries core async aeron_async alcotest alcotest-async))
+
+; Not a (test): forks real [aeronmd] processes and waits out real driver
+; timeouts, which does not belong in `dune runtest`. Run by hand, see the
+; comment at the top of the file.
+(executable
+ (name manual_persistent_driver_test)
+ (modules manual_persistent_driver_test)
+ (preprocess
+  (pps ppx_jane))
+ (libraries core core_unix async aeron aeron_async logs))

@@ -23,7 +23,7 @@ let subscribe_direct ?driver_timeout prefix chan streamID =
   create ?driver_timeout prefix
   >>=? fun (conn, errors) ->
   don't_wait_for
-    (Pipe.iter_without_pushback errors ~f:(fun err ->
+    (Pipe.iter_without_pushback errors ~f:(fun (_, err) ->
        Lo.err (fun m -> m "%a" Error.pp err)));
   let terminate = Ivar.create () in
   Signal.(handle terminating ~f:(fun _ -> Ivar.fill_if_empty terminate ()));
@@ -37,11 +37,15 @@ let subscribe_direct ?driver_timeout prefix chan streamID =
   let handle client =
     Lo.debug (fun m -> m "start handle");
     Aeron_async.add_subscription client chan ~streamID cb
-    >>= fun (_sub, consts) ->
-    Lo.info (fun m ->
-      m "Subscription created %a" Sexp.pp (Subscription.sexp_of_consts consts));
-    (* Important: wait till client is closed before looping. *)
-    Deferred.any [ Ivar.read terminate; close_finished client ]
+    >>= function
+    | Error err ->
+      Lo.err (fun m -> m "%a" Error.pp err);
+      Deferred.unit
+    | Ok (_sub, consts) ->
+      Lo.info (fun m ->
+        m "Subscription created %a" Sexp.pp (Subscription.sexp_of_consts consts));
+      (* Important: wait till client is closed before looping. *)
+      Deferred.any [ Ivar.read terminate; close_finished client ]
   in
   let rec loop () =
     if Ivar.is_full terminate
@@ -95,7 +99,7 @@ let publish driver_timeout dir channel streamID sz direct =
   create ?driver_timeout dir
   >>=? fun (conn, errors) ->
   don't_wait_for
-    (Pipe.iter_without_pushback errors ~f:(fun err ->
+    (Pipe.iter_without_pushback errors ~f:(fun (_, err) ->
        Lo.err (fun m -> m "%a" Error.pp err)));
   let terminate = Ivar.create () in
   Clock_ns.every
