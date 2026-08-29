@@ -96,6 +96,8 @@ let wait_for_message ~timeout received =
 let main dir () =
   Core_unix.mkdir_p dir;
   let received = Queue.create () in
+  let version = Aeron.Version.current () in
+  Lo.app (fun m -> m "linked against %a" Aeron.Version.pp version);
   Lo.app (fun m -> m "=== starting aeronmd #1 in %s ===" dir);
   spawn_driver dir
   >>= fun driver1 ->
@@ -113,7 +115,7 @@ let main dir () =
   in
   Aeron_async.Persistent.add_exclusive_publication client chan ~streamID encoder
   >>= fun pub_res ->
-  let pub, _consts = Or_error.ok_exn pub_res in
+  let pub, (pub_consts : Aeron.pub_consts) = Or_error.ok_exn pub_res in
   Aeron_async.Persistent.add_subscription client chan ~streamID on_msg
   >>= fun sub_res ->
   let sub, _consts = Or_error.ok_exn sub_res in
@@ -139,6 +141,29 @@ let main dir () =
   (match Or_error.ok_exn connected_res with
    | true -> Lo.app (fun m -> m "PASS: subscription is_connected true")
    | false -> failwith "subscription is_connected: false with a live publisher");
+  Aeron_async.Persistent.Client.counters_reader client
+  >>= fun reader_res ->
+  let reader = Or_error.ok_exn reader_res in
+  let counter_id = pub_consts.publication_limit_counter_id in
+  let label = Aeron.Counters.label reader counter_id in
+  let type_id = Aeron.Counters.type_id reader counter_id in
+  let value = Aeron.Counters.value reader counter_id in
+  Lo.app (fun m ->
+    m
+      "publication limit counter #%ld: type_id=%ld value=%Ld label=%S"
+      counter_id
+      type_id
+      value
+      label);
+  if String.is_substring label ~substring:"pub-lmt"
+  then Lo.app (fun m -> m "PASS: counter label looks like a publication limit")
+  else failwithf "counter #%ld: unexpected label %S" counter_id label ();
+  let snapshot = Aeron.Counters.snapshot reader in
+  Lo.app (fun m -> m "counters snapshot: %d allocated counters" (List.length snapshot));
+  if List.exists snapshot ~f:(fun (c : Aeron.Counters.counter) ->
+       Int32.equal c.id counter_id)
+  then Lo.app (fun m -> m "PASS: snapshot includes the publication limit counter")
+  else failwithf "snapshot: counter #%ld missing from the allocated set" counter_id ();
   Lo.app (fun m ->
     m "=== killing aeronmd #1 (pid %s) ===" (Pid.to_string (Process.pid driver1)));
   Process.send_signal driver1 Signal.kill;

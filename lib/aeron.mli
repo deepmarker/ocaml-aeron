@@ -42,6 +42,57 @@ val close : t -> unit
     [timeout_ms] only if the heartbeat looks stale. *)
 val is_driver_active : string -> int -> bool
 
+(** Version of the linked client library baked in at *its* build time, not
+    whatever driver this process happens to be talking to. *)
+module Version : sig
+  type t =
+    { major : int
+    ; minor : int
+    ; patch : int
+    ; text : string (** e.g. ["1.53.0"] *)
+    ; full : string (** e.g. ["aeron version=1.53.0 commit=..."] *)
+    ; gitsha : string
+    }
+  [@@deriving sexp]
+
+  val current : unit -> t
+  val pp : Format.formatter -> t -> unit
+end
+
+(** The counters reader: the same shared-memory counters buffer the media
+    driver itself publishes into (publication/subscription positions,
+    backpressure, loss, byte/error counts, etc), reachable from a
+    connected client. *)
+module Counters : sig
+  type reader
+
+  val reader : t -> reader
+  val max_counter_id : reader -> int32
+
+  (** Dereferences straight into shared memory: every call re-reads
+      whatever the driver most recently wrote. *)
+  val value : reader -> int32 -> int64
+
+  val label : reader -> int32 -> string
+  val type_id : reader -> int32 -> int32
+
+  (** 0 = unused, 1 = allocated, -1 = reclaimed. *)
+  val state : reader -> int32 -> int32
+
+  type counter =
+    { id : int32
+    ; type_id : int32
+    ; value : int64
+    ; label : string
+    }
+  [@@deriving sexp]
+
+  (** Every currently-allocated counter -- unused/reclaimed slots are
+      skipped, since [type_id]/[label]/[value] on one of those read back
+      garbage rather than failing. *)
+  val snapshot : reader -> counter list
+end
+
 val alloc_claim : unit -> claim
 val bigstring_of_claim : claim -> Bigstringaf.t
 val commit_claim : claim -> int

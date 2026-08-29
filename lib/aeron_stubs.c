@@ -207,6 +207,104 @@ CAMLprim value ml_aeron_is_driver_active(value dirname, value timeout_ms) {
     CAMLreturn(Val_bool(active));
 }
 
+// Version of the linked client library, baked in at its own build time --
+// not the version of whatever driver this process happens to be talking
+// to. No aeron_t/aeron_context_t needed for any of these.
+CAMLprim value ml_aeron_version_major(value unit) {
+    return Val_int(aeron_version_major());
+}
+
+CAMLprim value ml_aeron_version_minor(value unit) {
+    return Val_int(aeron_version_minor());
+}
+
+CAMLprim value ml_aeron_version_patch(value unit) {
+    return Val_int(aeron_version_patch());
+}
+
+CAMLprim value ml_aeron_version_text(value unit) {
+    CAMLparam1(unit);
+    CAMLreturn(caml_copy_string(aeron_version_text()));
+}
+
+CAMLprim value ml_aeron_version_full(value unit) {
+    CAMLparam1(unit);
+    CAMLreturn(caml_copy_string(aeron_version_full()));
+}
+
+CAMLprim value ml_aeron_version_gitsha(value unit) {
+    CAMLparam1(unit);
+    CAMLreturn(caml_copy_string(aeron_version_gitsha()));
+}
+
+// Counters: aeron_counters_reader(client) hands back a reader over the
+// same counters buffer the media driver itself publishes into (positions,
+// backpressure, loss, etc) -- maintained by the client, not ours to free.
+// One accessor per field rather than a single struct-returning stub,
+// mirroring aeron_subscription_constants/aeron_publication_constants
+// elsewhere in this file would have meant building an OCaml record from
+// inside a C callback for [snapshot]'s all-counters case below; simple
+// per-id accessors let that walk live entirely in aeron.ml instead.
+CAMLprim value ml_aeron_counters_reader(value client) {
+    aeron_counters_reader_t *reader = aeron_counters_reader(Ptr_val(client));
+    if (reader == NULL) {
+        caml_failwith("aeron_counters_reader: no counters reader for this client");
+    }
+    return Val_ptr(reader);
+}
+
+CAMLprim value ml_aeron_counters_reader_max_counter_id(value reader) {
+    return caml_copy_int32(aeron_counters_reader_max_counter_id(Ptr_val(reader)));
+}
+
+// Dereferences straight into the shared-memory counter value, the same
+// live value the driver itself is concurrently updating -- there is
+// nothing to poll or refresh, every call just re-reads it.
+CAMLprim value ml_aeron_counters_reader_value(value reader, value counter_id) {
+    int64_t *addr = aeron_counters_reader_addr(Ptr_val(reader), Int32_val(counter_id));
+    if (addr == NULL) {
+        caml_failwith("aeron_counters_reader_addr: invalid counter id");
+    }
+    return caml_copy_int64(*addr);
+}
+
+CAMLprim value ml_aeron_counters_reader_label(value reader, value counter_id) {
+    CAMLparam2(reader, counter_id);
+    CAMLlocal1(res);
+    char buffer[AERON_COUNTER_MAX_LABEL_LENGTH];
+    int ret = aeron_counters_reader_counter_label(
+        Ptr_val(reader), Int32_val(counter_id), buffer, sizeof(buffer));
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    res = caml_alloc_string((size_t)ret);
+    memcpy(Bytes_val(res), buffer, (size_t)ret);
+    CAMLreturn(res);
+}
+
+CAMLprim value ml_aeron_counters_reader_type_id(value reader, value counter_id) {
+    int32_t type_id;
+    int ret = aeron_counters_reader_counter_type_id(Ptr_val(reader), Int32_val(counter_id), &type_id);
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    return caml_copy_int32(type_id);
+}
+
+// AERON_COUNTER_RECORD_{UNUSED,ALLOCATED,RECLAIMED} (0/1/-1): [type_id] and
+// [label] above only range-check [counter_id], they don't check the slot
+// is actually allocated, so a slot that's UNUSED or RECLAIMED reads back
+// whatever garbage or stale metadata is still sitting there instead of
+// failing. [snapshot] in aeron.ml filters on this before trusting either.
+CAMLprim value ml_aeron_counters_reader_state(value reader, value counter_id) {
+    int32_t state;
+    int ret = aeron_counters_reader_counter_state(Ptr_val(reader), Int32_val(counter_id), &state);
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    return caml_copy_int32(state);
+}
+
 CAMLprim value ml_aeron_async_add_publication (value client, value uri, value stream_id) {
   CAMLparam3(client, uri, stream_id);
   aeron_async_add_publication_t *pub;

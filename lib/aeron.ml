@@ -126,6 +126,102 @@ external close : t -> unit = "ml_aeron_close"
    client. Blocks up to [timeout_ms] only if the heartbeat looks stale. *)
 external is_driver_active : string -> int -> bool = "ml_aeron_is_driver_active"
 
+(* Version of the linked client library baked in at *its* build time, not
+   whatever driver this process happens to be talking to -- answers
+   "what am I actually built against", the same question the 1.53 upgrade
+   this module was written for had to answer by cross-referencing
+   pacman/AUR packages by hand. *)
+module Version = struct
+  type t =
+    { major : int
+    ; minor : int
+    ; patch : int
+    ; text : string
+    ; full : string
+    ; gitsha : string
+    }
+  [@@deriving sexp]
+
+  external major : unit -> int = "ml_aeron_version_major" [@@noalloc]
+  external minor : unit -> int = "ml_aeron_version_minor" [@@noalloc]
+  external patch : unit -> int = "ml_aeron_version_patch" [@@noalloc]
+  external text : unit -> string = "ml_aeron_version_text"
+  external full : unit -> string = "ml_aeron_version_full"
+  external gitsha : unit -> string = "ml_aeron_version_gitsha"
+
+  let current () =
+    { major = major ()
+    ; minor = minor ()
+    ; patch = patch ()
+    ; text = text ()
+    ; full = full ()
+    ; gitsha = gitsha ()
+    }
+  ;;
+
+  let pp ppf t = Sexplib.Sexp.pp ppf (sexp_of_t t)
+end
+
+(* The counters reader: the same shared-memory counters buffer the media
+   driver itself publishes into (publication/subscription positions,
+   backpressure, loss, byte/error counts, etc), reachable from a connected
+   client without going through the separate aeron_cnc_* / cnc.dat route
+   the standalone aeron-stat tooling uses. *)
+module Counters = struct
+  type reader
+
+  external reader : t -> reader = "ml_aeron_counters_reader"
+
+  (* Not [@@noalloc]: unlike the [bool]/[int] externals elsewhere in this
+     file, an [int32] return value is boxed -- [ml_aeron_counters_reader_
+     max_counter_id] calls [caml_copy_int32], which allocates. Marking it
+     [@@noalloc] anyway (an earlier mistake here) let the compiler skip
+     the bookkeeping an allocating call needs and produced silent garbage
+     values instead of a crash, confirmed by [snapshot] returning a
+     nonsensical max_counter_id against a real driver. *)
+  external max_counter_id : reader -> int32 = "ml_aeron_counters_reader_max_counter_id"
+
+  (* Dereferences straight into shared memory: every call re-reads whatever
+     the driver most recently wrote, there is nothing to refresh. *)
+  external value : reader -> int32 -> int64 = "ml_aeron_counters_reader_value"
+
+  external label : reader -> int32 -> string = "ml_aeron_counters_reader_label"
+  external type_id : reader -> int32 -> int32 = "ml_aeron_counters_reader_type_id"
+
+  (* 0 = unused, 1 = allocated, -1 = reclaimed -- the AERON_COUNTER_RECORD_
+     constants. *)
+  external state : reader -> int32 -> int32 = "ml_aeron_counters_reader_state"
+
+  type counter =
+    { id : int32
+    ; type_id : int32
+    ; value : int64
+    ; label : string
+    }
+  [@@deriving sexp]
+
+  (* Walks every counter id up to [max_counter_id], keeping only the
+     allocated ones: [type_id]/[label]/[value] on an unused or reclaimed
+     slot don't fail, they read back whatever garbage or stale data still
+     sits in that shared-memory slot, so [state] is checked first rather
+     than trusting them directly. *)
+  let snapshot r =
+    let allocated = 1l in
+    let rec loop acc id =
+      if id > max_counter_id r
+      then List.rev acc
+      else (
+        let acc =
+          if state r id = allocated
+          then { id; type_id = type_id r id; value = value r id; label = label r id } :: acc
+          else acc
+        in
+        loop acc (Int32.add id 1l))
+    in
+    loop [] 0l
+  ;;
+end
+
 module Header = struct
   [%%cstruct
     type values =

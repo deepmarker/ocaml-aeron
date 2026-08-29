@@ -370,6 +370,7 @@ let create ?driver_timeout dir =
 
 let is_closed { stop; _ } = Ivar.is_full stop
 let close_finished { stop; _ } = Ivar.read stop
+let counters_reader { client; _ } = Counters.reader client
 
 let add_concurrent_publication ({ client; pubs; stop; _ } as t) chan ~streamID encode =
   if Ivar.is_full stop then raise Stopped;
@@ -598,6 +599,10 @@ module Persistent = struct
     let raw_client t =
       M.connected_or_failed_to_connect t
       >>|? fun (conn : Conn.t) -> conn.client, Conn.close_finished conn
+    ;;
+
+    let counters_reader t =
+      raw_client t >>|? fun (client, (_ : unit Deferred.t)) -> Counters.reader client
     ;;
   end
 

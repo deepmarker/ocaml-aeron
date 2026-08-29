@@ -41,6 +41,11 @@ val create
 
 include Persistent_connection_kernel.Closable with type t := t
 
+(** [t]'s counters reader -- the same shared-memory buffer the media
+    driver publishes positions/backpressure/loss/etc into. See
+    [Aeron.Counters]. *)
+val counters_reader : t -> Counters.reader
+
 exception
   WorkError of
     { err : Err.t
@@ -133,6 +138,9 @@ module Persistent : sig
       -> t
 
     include Persistent_connection_kernel.Closable with type t := t
+
+    (** [t]'s counters reader, once connected. See [Aeron.Counters]. *)
+    val counters_reader : t -> Counters.reader Deferred.Or_error.t
   end
 
   (* Publications added here are the same [publication] type as above --
