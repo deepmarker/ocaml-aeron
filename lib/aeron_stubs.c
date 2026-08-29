@@ -178,6 +178,35 @@ CAMLprim value ml_aeron_close (value client) {
     CAMLreturn(Val_unit);
 }
 
+// aeron_is_driver_active_with_cnc (aeron_driver_context.c) calls log_func
+// unconditionally, with no NULL check, on every branch that's actually
+// exercised when [dirname] already exists as a directory -- which is the
+// common case here, since [dirname] is the client's own aeron.dir. Passing
+// NULL segfaults on essentially every real call; this discards the
+// diagnostic strings instead.
+static void noop_log(const char *message) {
+    (void)message;
+}
+
+// Checks whether a media driver is live in [dirname] without opening a
+// client against it: reads its cnc.dat heartbeat directly and blocks up to
+// [timeout_ms] only if it looks stale, rather than going through the
+// connect-and-time-out path [ml_aeron_init] would. No client, no context,
+// nothing to close either way.
+//
+// Despite being declared in aeronc.h, aeron_is_driver_active is only
+// exported by libaeron_driver.so, not libaeron.so: it's implemented in
+// aeron-driver/src/main/c/aeron_driver_context.c and is what aeronmd
+// itself runs on its own startup to refuse to start a second driver
+// against a directory another one is already live in -- not a
+// client-conductor operation, hence the extra -laeron_driver link flag
+// (see lib/dune) this stub alone requires.
+CAMLprim value ml_aeron_is_driver_active(value dirname, value timeout_ms) {
+    CAMLparam2(dirname, timeout_ms);
+    bool active = aeron_is_driver_active(String_val(dirname), Long_val(timeout_ms), noop_log);
+    CAMLreturn(Val_bool(active));
+}
+
 CAMLprim value ml_aeron_async_add_publication (value client, value uri, value stream_id) {
   CAMLparam3(client, uri, stream_id);
   aeron_async_add_publication_t *pub;
@@ -343,6 +372,11 @@ CAMLprim value ml_aeron_subscription_close(value ba) {
 CAMLprim value ml_aeron_subscription_is_closed(value ba) {
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     return(Val_bool(aeron_subscription_is_closed(sub->sub)));
+}
+
+CAMLprim value ml_aeron_subscription_is_connected(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return(Val_bool(aeron_subscription_is_connected(sub->sub)));
 }
 
 CAMLprim value ml_aeron_subscription_channel_status(value ba) {

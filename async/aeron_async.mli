@@ -19,6 +19,13 @@ val poll_until
   -> (unit -> 'a option)
   -> 'a Deferred.Or_error.t
 
+(** [is_driver_active ?timeout_ms dir] checks [dir] for a live media
+    driver's cnc.dat heartbeat without opening a client against it -- e.g.
+    to back off a reconnect loop before [create], or for a health check
+    that shouldn't need a full client. Runs off the scheduler thread since
+    the underlying check can block up to [timeout_ms] (default 1s). *)
+val is_driver_active : ?timeout_ms:int -> string -> bool Deferred.t
+
 (** [create aeron_dir] returns an aeron handle as well as an error pipe,
     that must be processed. Errors carry the decoded [Err.t] alongside the
     rendered [Error.t] because the two client-facing entry points disagree
@@ -66,6 +73,7 @@ val add_subscription
   -> (subscription * Subscription.consts) Deferred.Or_error.t
 
 val close_subscription : t -> subscription -> unit Deferred.t
+val is_connected : subscription -> bool
 
 (** Publication *)
 
@@ -158,4 +166,5 @@ module Persistent : sig
     -> (subscription * Subscription.consts) Deferred.Or_error.t
 
   val close_subscription : subscription -> unit Deferred.t
+  val is_connected : subscription -> bool Deferred.Or_error.t
 end

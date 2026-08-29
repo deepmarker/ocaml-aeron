@@ -339,6 +339,13 @@ let get_error_pipe r =
   Pipe.create_reader ~close_on_exception:false on_w
 ;;
 
+(* Runs the blocking cnc.dat check off the scheduler thread, the same way
+   [create] below runs [init_exn] -- [Aeron.is_driver_active] can block up
+   to [timeout_ms] reading a heartbeat file. *)
+let is_driver_active ?(timeout_ms = 1000) dir =
+  In_thread.run (fun () -> Aeron.is_driver_active dir timeout_ms)
+;;
+
 (* We set a timeout of one second by default. *)
 let create ?driver_timeout dir =
   let nfo = Info.create_s [%message "Aeron_async.create"] in
@@ -399,6 +406,8 @@ let close_subscription_aux { sub; r } =
 let close_subscription t x =
   if Ivar.is_full t.stop then raise Stopped else close_subscription_aux x
 ;;
+
+let is_connected { sub; _ } = Subscription.is_connected sub
 
 let start_polling_subscription
       ?(stop = Deferred.never ())
@@ -683,6 +692,11 @@ module Persistent = struct
       M.connected_or_failed_to_connect t
       >>|? fun { Conn.sub; _ } -> Aeron.Subscription.consts sub.sub
     ;;
+
+    let is_connected t =
+      M.connected_or_failed_to_connect t
+      >>|? fun { Conn.sub; _ } -> is_connected sub
+    ;;
   end
 
   type subscription = Subscription.t
@@ -693,4 +707,5 @@ module Persistent = struct
   ;;
 
   let close_subscription (sub : subscription) = Subscription.close sub
+  let is_connected (sub : subscription) = Subscription.is_connected sub
 end

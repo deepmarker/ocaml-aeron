@@ -4,7 +4,8 @@
   (language c)
   (names aeron_stubs)
   (flags :standard -Wall -Werror))
- (c_library_flags (-laeron))
+ (c_library_flags
+  (-laeron -laeron_driver))
  (preprocess
   (pps ppx_sexp_conv ppx_cstruct))
  (libraries unix uri sexplib bigstringaf))

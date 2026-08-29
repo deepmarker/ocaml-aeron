@@ -116,7 +116,7 @@ let main dir () =
   let pub, _consts = Or_error.ok_exn pub_res in
   Aeron_async.Persistent.add_subscription client chan ~streamID on_msg
   >>= fun sub_res ->
-  let (_ : Aeron_async.Persistent.subscription), _consts = Or_error.ok_exn sub_res in
+  let sub, _consts = Or_error.ok_exn sub_res in
   (* Give the pub/sub images time to find each other over IPC before the
      first offer. *)
   Clock_ns.after (Time_ns.Span.of_int_ms 500)
@@ -129,15 +129,35 @@ let main dir () =
   if String.equal msg "hello-1"
   then Lo.app (fun m -> m "PASS: phase 1 (%s)" msg)
   else failwithf "phase 1: unexpected message %s" msg ();
+  Aeron_async.is_driver_active dir
+  >>= fun active ->
+  if active
+  then Lo.app (fun m -> m "PASS: is_driver_active true against a live driver")
+  else failwith "is_driver_active: false against a live driver";
+  Aeron_async.Persistent.is_connected sub
+  >>= fun connected_res ->
+  (match Or_error.ok_exn connected_res with
+   | true -> Lo.app (fun m -> m "PASS: subscription is_connected true")
+   | false -> failwith "subscription is_connected: false with a live publisher");
   Lo.app (fun m ->
     m "=== killing aeronmd #1 (pid %s) ===" (Pid.to_string (Process.pid driver1)));
   Process.send_signal driver1 Signal.kill;
   Process.wait driver1
   >>= fun (_ : Unix.Exit_or_signal.t) ->
   (* Past [driver_timeout] the client's conductor must see the driver is
-     gone and rebuild itself; give it a comfortable margin. *)
+     gone and rebuild itself; give it a comfortable margin. This also gives
+     [is_driver_active]'s own heartbeat-staleness check (default
+     [timeout_ms] = 1s) room to catch up: right after the kill signal the
+     cnc.dat heartbeat is still fresh, since nothing wrote to it since --
+     [is_driver_active] would (correctly) still report the driver active
+     until that heartbeat ages past its own timeout. *)
   Clock_ns.after (Time_ns.Span.scale driver_timeout 2.)
   >>= fun () ->
+  Aeron_async.is_driver_active dir
+  >>= fun active ->
+  if active
+  then failwith "is_driver_active: true well after killing the driver"
+  else Lo.app (fun m -> m "PASS: is_driver_active false well after killing the driver");
   Lo.app (fun m -> m "=== starting aeronmd #2 (same dir) ===");
   spawn_driver ~force_recreate:true dir
   >>= fun driver2 ->
@@ -153,6 +173,16 @@ let main dir () =
   if String.equal msg "hello-2"
   then Lo.app (fun m -> m "PASS: phase 2 (%s) -- survived the driver dying" msg)
   else failwithf "phase 2: unexpected message %s" msg ();
+  Aeron_async.is_driver_active dir
+  >>= fun active ->
+  if active
+  then Lo.app (fun m -> m "PASS: is_driver_active true again against driver #2")
+  else failwith "is_driver_active: false against a live driver #2";
+  Aeron_async.Persistent.is_connected sub
+  >>= fun connected_res ->
+  (match Or_error.ok_exn connected_res with
+   | true -> Lo.app (fun m -> m "PASS: subscription is_connected true again after reconnect")
+   | false -> failwith "subscription is_connected: false after reconnect");
   Aeron_async.Persistent.Client.close client
   >>= fun () ->
   Process.send_signal driver2 Signal.kill;

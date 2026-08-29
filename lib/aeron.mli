@@ -34,6 +34,14 @@ val main_do_work : t -> int
 val errmsg : unit -> string
 val errcode : unit -> Err.t
 val close : t -> unit
+
+(** [is_driver_active dirname timeout_ms] checks [dirname] for a live media
+    driver's cnc.dat heartbeat without opening a client against it -- e.g.
+    to back off a reconnect loop before attempting [init_exn], or for a
+    health check that shouldn't need a full client. Blocks up to
+    [timeout_ms] only if the heartbeat looks stale. *)
+val is_driver_active : string -> int -> bool
+
 val alloc_claim : unit -> claim
 val bigstring_of_claim : claim -> Bigstringaf.t
 val commit_claim : claim -> int
@@ -77,6 +85,7 @@ module Subscription : sig
   val add_poll : add -> int -> t option
   val close : t -> unit
   val is_closed : t -> bool
+  val is_connected : t -> bool
 
   (** Weirdly returns -1 for IPC transport. Supposed to return 1 on
       success and -1 on error. *)

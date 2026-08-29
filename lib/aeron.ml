@@ -120,6 +120,12 @@ let errcode () = Err.of_int (errcode ())
 
 external close : t -> unit = "ml_aeron_close"
 
+(* Checks [dirname] for a live media driver's cnc.dat heartbeat without
+   opening a client against it -- e.g. to back off a reconnect loop before
+   attempting [init_exn], or for a health check that shouldn't need a full
+   client. Blocks up to [timeout_ms] only if the heartbeat looks stale. *)
+external is_driver_active : string -> int -> bool = "ml_aeron_is_driver_active"
+
 module Header = struct
   [%%cstruct
     type values =
@@ -211,6 +217,9 @@ module Subscription = struct
   external close : Bigstringaf.t -> unit = "ml_aeron_subscription_close"
 
   external is_closed : Bigstringaf.t -> bool = "ml_aeron_subscription_is_closed"
+  [@@noalloc]
+
+  external is_connected : Bigstringaf.t -> bool = "ml_aeron_subscription_is_connected"
   [@@noalloc]
 
   external status : Bigstringaf.t -> int = "ml_aeron_subscription_channel_status"
