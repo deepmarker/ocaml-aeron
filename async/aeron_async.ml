@@ -555,6 +555,15 @@ module Persistent = struct
                   this. This error pipe is the only place these show up. *)
                Lo.err (fun m -> m "aeron: client fault, rebuilding client");
                don't_wait_for (Conn.close conn)
+             | Client_closed ->
+               (* The conductor reported closing directly (see
+                  [aeron_on_close_client_t]/[forward_close]) rather than
+                  us having to infer it from a timeout code above. Covers
+                  both our own [Conn.close] tearing this client down --
+                  [Conn.close] is a no-op the second time, since [stop]
+                  is already full by then -- and a conductor death this
+                  pipe hasn't already reported some other way. *)
+               don't_wait_for (Conn.close conn)
              | Buffer_full | Unknown _ -> ()));
         Clock_ns.every' ~stop:(Conn.close_finished conn) do_work_period (fun () ->
           match Result.try_with (fun () -> do_work_exn conn) with

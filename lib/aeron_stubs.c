@@ -31,9 +31,14 @@ static ssize_t write_all(int fd, const void *buffer, size_t length) {
     return length;
 }
 
-static void forward_errors(void *clientd, int errcode, const char *message) {
-    // How do I read a be 16 bits integer from clientd?
-    int fd = be16toh(*(uint16_t *)clientd);
+// Frames one (errcode, message) pair onto [fd] in the format
+// [Aeron_async.get_error_pipe] parses: a be32 errcode, a be32 message
+// length, then the message bytes. Shared by [forward_errors], which
+// forwards real [aeron_error_handler_t] codes, and [forward_close], which
+// reports the client closing under the reserved sentinel code [0] (see
+// [Aeron.Err.Client_closed] -- real Aeron codes are all >= 1000 in
+// magnitude, so 0 can never collide with one).
+static void write_frame(int fd, int errcode, const char *message) {
     size_t message_len = strlen(message);
     if (message_len > UINT16_MAX) {
         message_len = UINT16_MAX;  // Limit message length
@@ -48,6 +53,24 @@ static void forward_errors(void *clientd, int errcode, const char *message) {
     write_all(fd, message, message_len);
 }
 
+static void forward_errors(void *clientd, int errcode, const char *message) {
+    // How do I read a be 16 bits integer from clientd?
+    int fd = be16toh(*(uint16_t *)clientd);
+    write_frame(fd, errcode, message);
+}
+
+// Called by [aeron_client_t] from its own conductor thread when the client
+// is closing, whether that is us calling [aeron_close] or the conductor
+// giving up on its own (e.g. a driver timeout). Neither this nor
+// [forward_errors] above may touch the OCaml runtime -- the conductor
+// thread does not hold it -- hence the same raw fd + [write(2)] channel
+// used for errors, multiplexed onto the same frame format instead of a
+// second pipe.
+static void forward_close(void *clientd) {
+    int fd = be16toh(*(uint16_t *)clientd);
+    write_frame(fd, 0, "");
+}
+
 CAMLprim value ml_aeron_context_init(value ba) {
     CAMLparam1(ba);
     aeron_context_t *ctx;
@@ -56,6 +79,10 @@ CAMLprim value ml_aeron_context_init(value ba) {
         caml_failwith(aeron_errmsg());
     }
     ret = aeron_context_set_error_handler(ctx, forward_errors, Caml_ba_data_val(ba));
+    if (ret < 0) {
+        caml_failwith(aeron_errmsg());
+    }
+    ret = aeron_context_set_on_close_client(ctx, forward_close, Caml_ba_data_val(ba));
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
     }

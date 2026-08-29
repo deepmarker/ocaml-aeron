@@ -35,6 +35,7 @@ module Err = struct
     | Client_timeout
     | Conductor_service_timeout
     | Buffer_full
+    | Client_closed
     | Unknown of int
   [@@deriving sexp]
 
@@ -47,12 +48,23 @@ module Err = struct
      /usr/include/aeron/aeronc.h on this system) -- confirmed by driving an
      actual driver-timeout against a real media driver, not by reading
      either header. Accept both so a client-fatal error is recognized
-     regardless of which path reported it. *)
+     regardless of which path reported it.
+
+     [Client_closed] is not an Aeron error code at all: it is the sentinel
+     [0] the [aeron_on_close_client_t] stub writes down the same wire
+     format the error handler uses (see [forward_close] in
+     aeron_stubs.c), reporting the client conductor closing -- whether we
+     asked it to or it gave up on its own -- as unambiguously as
+     [Driver_timeout] & co report a driver-side timeout, and multiplexed
+     onto that same pipe rather than a second one. [0] can't collide with
+     a real code: those are all >= 1000 in magnitude on both sign
+     conventions above. *)
   let of_int = function
     | -1000 | 1000 -> Driver_timeout
     | -1001 | 1001 -> Client_timeout
     | -1002 | 1002 -> Conductor_service_timeout
     | -1003 | 1003 -> Buffer_full
+    | 0 -> Client_closed
     | i -> Unknown i
   ;;
 
@@ -61,6 +73,7 @@ module Err = struct
     | Client_timeout -> -1001
     | Conductor_service_timeout -> -1002
     | Buffer_full -> -1003
+    | Client_closed -> 0
     | Unknown i -> i
   ;;
 
