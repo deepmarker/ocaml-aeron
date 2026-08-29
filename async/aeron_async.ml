@@ -69,6 +69,7 @@ module type S = sig
   val offer : t -> ?pos:int -> ?len:int -> Bigstringaf.t -> (int, OfferError.t) result
   val tryclaim : t -> int -> claim -> (int, OfferError.t) result
   val consts : t -> pub_consts
+  val is_connected : t -> bool
 
   (** Marks [t] closed without touching the underlying C object, unlike
       [close]. For when the client this publication was added through has
@@ -132,6 +133,7 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
   ;;
 
   let consts { pub; _ } = P.consts pub
+  let is_connected { pub; _ } = P.is_connected pub
 end
 
 module MkPublication (S : S) = struct
@@ -186,6 +188,14 @@ module MkPublication (S : S) = struct
 
   let consts { pub; _ } = PPub.connected_or_failed_to_connect pub >>|? S.consts
 
+  (* Non-blocking, unlike [consts]/[offer]: [None] while no connect attempt
+     has resolved yet (the persistent publication is still retrying, e.g.
+     against a client that hasn't reconnected). Exists for exactly the
+     situation where waiting is the problem being diagnosed --
+     [connected_or_failed_to_connect] would just join the same stuck
+     future [offer_bounded] is timing out on. *)
+  let is_connected_now { pub; _ } = Option.map (PPub.current_connection pub) ~f:S.is_connected
+
   let offer { pub; _ } ?pos ?len s =
     PPub.connected_or_failed_to_connect pub >>|? fun x -> S.offer x ?pos ?len s
   ;;
@@ -204,6 +214,39 @@ module MkPublication (S : S) = struct
       f bs msg;
       if commit_claim claim <> 0 then failwith "commit claim failed";
       Result.return newpos
+  ;;
+
+  (* Like [offer]/[tryclaim], but check [abandoned] right after the
+     connection resolves and before actually calling [S.offer]/[S.tryclaim]
+     -- unlike [Clock_ns.with_timeout], which only stops a caller from
+     *waiting* on this bind, not the bind itself: it still fires, and still
+     sends, whenever the publication next reconnects. [offer_bounded] fills
+     [abandoned] exactly when it gives up, so an attempt it already gave up
+     on does not silently deliver a stale message later, out of order
+     relative to whatever the caller sent instead in the meantime. Returns
+     [None] for "abandoned before it could send" as distinct from an actual
+     [S.offer]/[S.tryclaim] result. *)
+  let offer_or_abandon { pub; _ } ~abandoned ?pos ?len s =
+    PPub.connected_or_failed_to_connect pub
+    >>|? fun x -> if Ivar.is_full abandoned then None else Some (S.offer x ?pos ?len s)
+  ;;
+
+  let tryclaim_or_abandon { pub; _ } ~abandoned i claim =
+    PPub.connected_or_failed_to_connect pub
+    >>|? fun x -> if Ivar.is_full abandoned then None else Some (S.tryclaim x i claim)
+  ;;
+
+  let handle_direct_or_abandon pub ~abandoned sizer f claim msg =
+    let len = sizer msg in
+    tryclaim_or_abandon pub ~abandoned len claim
+    >>|? function
+    | None -> None
+    | Some (Error err) -> Some (Result.fail err)
+    | Some (Ok newpos) ->
+      let bs = bigstring_of_claim claim in
+      f bs msg;
+      if commit_claim claim <> 0 then failwith "commit claim failed";
+      Some (Result.return newpos)
   ;;
 end
 
@@ -225,6 +268,11 @@ type ('a, 'b) publication =
 let close_publication = function
   | Concurrent { pub; _ } -> Concurrent.PPub.close pub
   | Exclusive { pub; _ } -> Exclusive.PPub.close pub
+;;
+
+let is_connected_now : type a b. (a, b) publication -> bool option = function
+  | Concurrent p -> Concurrent.is_connected_now p
+  | Exclusive p -> Exclusive.is_connected_now p
 ;;
 
 type t =
@@ -258,6 +306,26 @@ let offer_pub
   | Exclusive ({ encode = Alloc f; _ } as pub) -> Exclusive.offer pub (f msg)
   | Exclusive ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
     Exclusive.handle_direct pub sizer f claim msg
+;;
+
+(* Mirrors [offer_pub], but through [offer_or_abandon]/[handle_direct_or_abandon]
+   -- see those for why [offer_bounded] needs this instead of racing
+   [offer_pub] against a timeout from the outside. *)
+let offer_pub_or_abandon
+  : type a b.
+    (a, b) publication
+    -> abandoned:unit Ivar.t
+    -> a
+    -> (int, OfferError.t) result option Deferred.Or_error.t
+  =
+  fun pub ~abandoned msg ->
+  match pub with
+  | Concurrent ({ encode = Alloc f; _ } as pub) -> Concurrent.offer_or_abandon pub ~abandoned (f msg)
+  | Concurrent ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
+    Concurrent.handle_direct_or_abandon pub ~abandoned sizer f claim msg
+  | Exclusive ({ encode = Alloc f; _ } as pub) -> Exclusive.offer_or_abandon pub ~abandoned (f msg)
+  | Exclusive ({ encode = Direct { sizer; f; claim }; _ } as pub) ->
+    Exclusive.handle_direct_or_abandon pub ~abandoned sizer f claim msg
 ;;
 
 let offer
@@ -344,6 +412,79 @@ let get_error_pipe r =
    to [timeout_ms] reading a heartbeat file. *)
 let is_driver_active ?(timeout_ms = 1000) dir =
   In_thread.run (fun () -> Aeron.is_driver_active dir timeout_ms)
+;;
+
+type stalled =
+  { pub_connected : bool option
+    (** [None] if no connect attempt on this publication has resolved yet
+        (still retrying against a client that hasn't reconnected) --
+        [is_connected_now] rather than a wait, since anything that waited
+        here would just join the same stuck future [offer_bounded] gave
+        up on. [Some b] once there is an actual handle to ask. *)
+  ; driver_active : bool option
+    (** [Some _] only when [offer_bounded] was given [~dir]; [None]
+        means "not checked", not "unknown/false". *)
+  }
+[@@deriving sexp_of]
+
+type offer_outcome =
+  | Sent of (int, OfferError.t) result
+  | Stalled of stalled
+      (** The message was not, and will not be, sent through this attempt.
+          Naively racing [offer_pub] against [Clock_ns.with_timeout] is not
+          enough to guarantee that: the timeout only stops a caller from
+          *waiting*, it does not cancel [offer_pub]'s own bind on
+          [connected_or_failed_to_connect], which still fires -- and still
+          calls the real [S.offer] -- the moment this publication next
+          reconnects, regardless of whether anyone is still waiting on it.
+          Confirmed live in test/manual_persistent_driver_test.exe: a
+          first, naive version of this delivered a message stalled during
+          an outage *after* the reconnect, ahead of one sent for real by a
+          later call. [offer_bounded] instead fills an [abandoned] ivar
+          the underlying bind checks right before it would call
+          [S.offer]/[S.tryclaim], so a [Stalled] attempt really does never
+          send. *)
+[@@deriving sexp_of]
+
+let default_offer_timeout = Time_ns.Span.of_int_sec 5
+
+(* Bounds [offer_pub_or_abandon] the way [poll_until] bounds add/close: a
+   persistent publication's [offer] waits on [connected_or_failed_to_connect],
+   which never becomes determined while it's still retrying against a dead
+   client/driver, so an unbounded wait here becomes an unbounded wait in
+   every caller -- for an actor built on a serial request queue, that stops
+   the queue for good (the instrument handler's 21-hour stall,
+   ../../../deploy/systemd/README.md, was found in exactly this state).
+   Filling [abandoned] on [`Timeout] is what makes this an actual
+   cancellation and not just a caller giving up on watching (see [Stalled]
+   above). [~dir], when given, spends one extra [is_driver_active] check on
+   a stall to say whether the driver itself is the problem, distinct from
+   our own client just not having reconnected yet. *)
+let offer_bounded_pub ?(timeout = default_offer_timeout) ?dir pub msg =
+  let abandoned = Ivar.create () in
+  let diagnose () =
+    (match dir with
+     | None -> Deferred.return None
+     | Some dir -> is_driver_active dir >>| Option.some)
+    >>| fun driver_active -> Ok (Stalled { pub_connected = is_connected_now pub; driver_active })
+  in
+  Clock_ns.with_timeout timeout (offer_pub_or_abandon pub ~abandoned msg)
+  >>= function
+  | `Result (Ok (Some res)) -> Deferred.Or_error.return (Sent res)
+  | `Result (Ok None) ->
+    (* Only reachable if something else filled [abandoned] before this
+       resolved, which nothing does outside the [`Timeout] case below;
+       kept as a defensive fallback rather than [assert false]. *)
+    diagnose ()
+  | `Result (Error _ as err) -> Deferred.return err
+  | `Timeout ->
+    Ivar.fill_if_empty abandoned ();
+    diagnose ()
+;;
+
+let offer_bounded t ?timeout ?dir pub msg =
+  if Ivar.is_full t.stop then raise Stopped;
+  offer_bounded_pub ?timeout ?dir pub msg
 ;;
 
 (* We set a timeout of one second by default. *)
@@ -624,6 +765,7 @@ module Persistent = struct
   ;;
 
   let offer = offer_pub
+  let offer_bounded = offer_bounded_pub
 
   (* Subscriptions: no [S]-shaped module exists for these upstream, so wrap
      them the same way [MkPublication] wraps publications: a small

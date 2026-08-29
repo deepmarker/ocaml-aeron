@@ -111,6 +111,46 @@ val offer
   -> 'a
   -> (int, OfferError.t) result Deferred.Or_error.t
 
+(** Non-blocking: [None] while the publication's persistent connection has
+    no live handle yet (still retrying); [Some b] once it does. Meant for
+    diagnosing a stall reported by [offer_bounded], not as a substitute for
+    [offer] itself. *)
+val is_connected_now : (_, _) publication -> bool option
+
+type stalled =
+  { pub_connected : bool option
+  ; driver_active : bool option
+    (** [Some _] only when [offer_bounded] was given [~dir]; [None] means
+        "not checked", not "unknown/false". *)
+  }
+[@@deriving sexp_of]
+
+type offer_outcome =
+  | Sent of (int, OfferError.t) result
+  | Stalled of stalled
+      (** The message was not, and will not be, sent through this attempt
+          -- [offer_bounded] cancels it, rather than merely giving up on
+          waiting for it (which would let it silently deliver late, out of
+          order, once the publication next reconnects; see the comment in
+          the .ml for how that was caught). *)
+[@@deriving sexp_of]
+
+(** [offer_bounded t ?timeout ?dir pub msg] is [offer] with the wait
+    bounded to [timeout] (default 5s): a persistent publication's [offer]
+    waits on its connection attempt resolving, which never happens while
+    it's still retrying against a dead client/driver, so an unbounded
+    wait here becomes an unbounded wait in every caller. A stall is a
+    genuine cancellation, not just a caller giving up (see [Stalled]).
+    Pass [~dir] (the publication's media driver directory) to also check
+    [is_driver_active] on a stall. *)
+val offer_bounded
+  :  t
+  -> ?timeout:Time_ns.Span.t
+  -> ?dir:string
+  -> ('a, _) publication
+  -> 'a
+  -> offer_outcome Deferred.Or_error.t
+
 val close_publication : (_, _) publication -> unit Deferred.t
 
 (** Auto-reconnecting layer. Use this instead of [create] /
@@ -161,6 +201,15 @@ module Persistent : sig
     -> (('a, 'b) publication * pub_consts) Deferred.Or_error.t
 
   val offer : ('a, _) publication -> 'a -> (int, OfferError.t) result Deferred.Or_error.t
+
+  (** See [offer_bounded] above -- no owning [t] to check here, since
+      these publications aren't tied to a single client. *)
+  val offer_bounded
+    :  ?timeout:Time_ns.Span.t
+    -> ?dir:string
+    -> ('a, _) publication
+    -> 'a
+    -> offer_outcome Deferred.Or_error.t
 
   type subscription
 

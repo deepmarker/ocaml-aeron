@@ -183,6 +183,26 @@ let main dir () =
   if active
   then failwith "is_driver_active: true well after killing the driver"
   else Lo.app (fun m -> m "PASS: is_driver_active false well after killing the driver");
+  (* The client has by now detected the dead driver and invalidated this
+     publication (see [MkPublication.create]'s [invalidate]), so its
+     persistent connection is genuinely retrying, not merely appearing
+     connected on a stale handle -- offering into it should actually
+     stall rather than just running slow. A short timeout is enough:
+     nothing can make this resolve while driver #2 hasn't started yet. *)
+  Aeron_async.Persistent.offer_bounded ~timeout:(Time_ns.Span.of_int_ms 500) ~dir pub "hello-stall"
+  >>= fun stall_res ->
+  (match Or_error.ok_exn stall_res with
+   | Aeron_async.Stalled { driver_active = Some false; pub_connected } ->
+     Lo.app (fun m ->
+       m
+         !"PASS: offer_bounded reports Stalled (driver_active=false, pub_connected=%{sexp:bool \
+           option})"
+         pub_connected)
+   | outcome ->
+     failwithf
+       "offer_bounded: expected Stalled with driver_active=Some false, got %s"
+       (Sexp.to_string_hum (Aeron_async.sexp_of_offer_outcome outcome))
+       ());
   Lo.app (fun m -> m "=== starting aeronmd #2 (same dir) ===");
   spawn_driver ~force_recreate:true dir
   >>= fun driver2 ->
@@ -198,6 +218,23 @@ let main dir () =
   if String.equal msg "hello-2"
   then Lo.app (fun m -> m "PASS: phase 2 (%s) -- survived the driver dying" msg)
   else failwithf "phase 2: unexpected message %s" msg ();
+  (* The "hello-stall" attempt from before the reconnect was cancelled, not
+     merely given up on -- a naive [Clock_ns.with_timeout] wrapper (an
+     earlier version of [offer_bounded], caught only by actually running
+     this test) let that same attempt fire for real once the publication
+     reconnected, delivering it late and ahead of "hello-2" even though
+     "hello-2" was offered, and actually sent, after the reconnect had
+     already happened. Give any such stray delivery a moment to show up,
+     then confirm the queue is otherwise empty. *)
+  Clock_ns.after (Time_ns.Span.of_int_sec 1)
+  >>= fun () ->
+  (match Queue.to_list received with
+   | [] -> Lo.app (fun m -> m "PASS: the stalled offer from before the reconnect never landed")
+   | strays ->
+     failwithf
+       "the stalled \"hello-stall\" offer was sent anyway, after the reconnect: %s"
+       (String.concat ~sep:", " strays)
+       ());
   Aeron_async.is_driver_active dir
   >>= fun active ->
   if active
@@ -208,6 +245,15 @@ let main dir () =
   (match Or_error.ok_exn connected_res with
    | true -> Lo.app (fun m -> m "PASS: subscription is_connected true again after reconnect")
    | false -> failwith "subscription is_connected: false after reconnect");
+  Aeron_async.Persistent.offer_bounded ~dir pub "hello-3"
+  >>= fun sent_res ->
+  (match Or_error.ok_exn sent_res with
+   | Aeron_async.Sent (Ok _) -> Lo.app (fun m -> m "PASS: offer_bounded reports Sent once reconnected")
+   | outcome ->
+     failwithf
+       "offer_bounded: expected Sent (Ok _) once reconnected, got %s"
+       (Sexp.to_string_hum (Aeron_async.sexp_of_offer_outcome outcome))
+       ());
   Aeron_async.Persistent.Client.close client
   >>= fun () ->
   Process.send_signal driver2 Signal.kill;
