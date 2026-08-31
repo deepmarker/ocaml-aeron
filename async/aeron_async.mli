@@ -117,6 +117,18 @@ val offer
     [offer] itself. *)
 val is_connected_now : (_, _) publication -> bool option
 
+(** The current handle's constants, without waiting on a reconnect the
+    way [add_*_publication]'s [pub_consts] result would. [None] while
+    there is no live handle.
+
+    [session_id] identifies the publication *session*: a persistent
+    publication re-added against a new client starts a new one, which
+    subscribers see as a new image, so a producer whose stream carries
+    per-session state (announcements a late image never saw, say) can
+    watch this to know its state was invalidated. [max_message_length]
+    is the largest single offer the current term buffer accepts. *)
+val consts_now : (_, _) publication -> pub_consts option
+
 type stalled =
   { pub_connected : bool option
   ; driver_active : bool option

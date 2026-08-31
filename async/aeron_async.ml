@@ -196,6 +196,14 @@ module MkPublication (S : S) = struct
      future [offer_bounded] is timing out on. *)
   let is_connected_now { pub; _ } = Option.map (PPub.current_connection pub) ~f:S.is_connected
 
+  (* Same non-blocking view, for the constants. [S.consts] is a plain
+     accessor on the handle, so unlike [consts] above this never waits
+     on a reconnect. The [session_id] it exposes is how a caller tells
+     that the publication was rebuilt underneath it: a persistent
+     publication re-added against a new client starts a new Aeron
+     session, which subscribers see as a new image. *)
+  let consts_now { pub; _ } = Option.map (PPub.current_connection pub) ~f:S.consts
+
   let offer { pub; _ } ?pos ?len s =
     PPub.connected_or_failed_to_connect pub >>|? fun x -> S.offer x ?pos ?len s
   ;;
@@ -273,6 +281,11 @@ let close_publication = function
 let is_connected_now : type a b. (a, b) publication -> bool option = function
   | Concurrent p -> Concurrent.is_connected_now p
   | Exclusive p -> Exclusive.is_connected_now p
+;;
+
+let consts_now : type a b. (a, b) publication -> pub_consts option = function
+  | Concurrent p -> Concurrent.consts_now p
+  | Exclusive p -> Exclusive.consts_now p
 ;;
 
 type t =
