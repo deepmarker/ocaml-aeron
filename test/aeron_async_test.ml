@@ -8,8 +8,8 @@ open Alcotest_async
    answering -- as it does when the machine suspends and the client times
    out -- was polled forever: the add never completed, the persistent
    connection wrapping the publication never saw an attempt fail, and every
-   offer waiting behind it hung indefinitely. One such hang froze an
-   instrument handler for 21 hours. *)
+   offer waiting behind it hung indefinitely. One such hang froze a
+   downstream service for 21 hours. *)
 
 let span = Time_ns.Span.of_int_ms
 

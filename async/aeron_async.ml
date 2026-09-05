@@ -466,8 +466,8 @@ let default_offer_timeout = Time_ns.Span.of_int_sec 5
    which never becomes determined while it's still retrying against a dead
    client/driver, so an unbounded wait here becomes an unbounded wait in
    every caller -- for an actor built on a serial request queue, that stops
-   the queue for good (the instrument handler's 21-hour stall,
-   ../../../deploy/systemd/README.md, was found in exactly this state).
+   the queue for good (one such actor was found wedged for 21 hours in
+   exactly this state).
    Filling [abandoned] on [`Timeout] is what makes this an actual
    cancellation and not just a caller giving up on watching (see [Stalled]
    above). [~dir], when given, spends one extra [is_driver_active] check on
