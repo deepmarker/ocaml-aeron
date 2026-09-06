@@ -85,13 +85,22 @@ end
 module MkAsyncPublication (P : Publication_sig) : S = struct
   type t =
     { pub : P.t
+    ; consts : pub_consts
+      (* Read once, when the publication is added, and never again. A
+         publication's constants do not change for its lifetime -- session id,
+         channel, stream id, term buffer length are all fixed when the driver
+         creates it -- so there is nothing to re-read, and re-reading is what
+         makes the accessor dangerous: the client that owns a publication frees
+         it when it dies, and nothing on this side can tell that the handle has
+         become dangling. Checking a flag first does not help, because the free
+         happens before any flag this side sets. *)
     ; closed : unit Ivar.t
     }
 
   let add t uri streamID =
     let wait = P.add t uri streamID in
     poll_until ~what:"add publication" (fun () -> P.add_poll wait)
-    >>|? fun pub -> { pub; closed = Ivar.create () }
+    >>|? fun pub -> { pub; consts = P.consts pub; closed = Ivar.create () }
   ;;
 
   let is_closed { pub; _ } = P.is_closed pub
@@ -99,7 +108,7 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
   let invalidate { closed; _ } = Ivar.fill_if_empty closed ()
 
   (* idempotent. *)
-  let close { pub; closed } =
+  let close { pub; closed; _ } =
     match Ivar.is_full closed with
     | true -> Deferred.unit
     | false ->
@@ -114,7 +123,7 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
       Ivar.fill_if_empty closed ()
   ;;
 
-  let offer { pub; closed } ?pos ?len buf =
+  let offer { pub; closed; _ } ?pos ?len buf =
     let res = P.offer ?pos ?len pub buf in
     match res with
     | Error Closed ->
@@ -123,7 +132,7 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
     | _ -> res
   ;;
 
-  let tryclaim { pub; closed } i claim =
+  let tryclaim { pub; closed; _ } i claim =
     let res = P.tryclaim pub i claim in
     match res with
     | Error Closed ->
@@ -132,7 +141,7 @@ module MkAsyncPublication (P : Publication_sig) : S = struct
     | _ -> res
   ;;
 
-  let consts { pub; _ } = P.consts pub
+  let consts { consts; _ } = consts
   let is_connected { pub; _ } = P.is_connected pub
 end
 
@@ -190,18 +199,19 @@ module MkPublication (S : S) = struct
 
   (* Non-blocking, unlike [consts]/[offer]: [None] while no connect attempt
      has resolved yet (the persistent publication is still retrying, e.g.
-     against a client that hasn't reconnected). Exists for exactly the
-     situation where waiting is the problem being diagnosed --
-     [connected_or_failed_to_connect] would just join the same stuck
-     future [offer_bounded] is timing out on. *)
+     against a client that hasn't reconnected), and [None] for a connection
+     already invalidated. Exists for exactly the situation where waiting is
+     the problem being diagnosed -- [connected_or_failed_to_connect] would
+     just join the same stuck future [offer_bounded] is timing out on. *)
   let is_connected_now { pub; _ } = Option.map (PPub.current_connection pub) ~f:S.is_connected
 
-  (* Same non-blocking view, for the constants. [S.consts] is a plain
-     accessor on the handle, so unlike [consts] above this never waits
-     on a reconnect. The [session_id] it exposes is how a caller tells
-     that the publication was rebuilt underneath it: a persistent
-     publication re-added against a new client starts a new Aeron
-     session, which subscribers see as a new image. *)
+  (* Same non-blocking view, for the constants. [S.consts] hands back what was
+     read when the publication was added -- they are fixed for its lifetime --
+     so this neither calls into C nor allocates, however often it is asked.
+     The [session_id] it exposes is how a caller tells that the publication was
+     rebuilt underneath it: a persistent publication re-added against a new
+     client starts a new Aeron session, which subscribers see as a new image,
+     and which arrives here as a different captured value. *)
   let consts_now { pub; _ } = Option.map (PPub.current_connection pub) ~f:S.consts
 
   let offer { pub; _ } ?pos ?len s =

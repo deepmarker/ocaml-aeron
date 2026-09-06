@@ -484,7 +484,7 @@ CAMLprim value ml_aeron_subscription_channel_status(value ba) {
 
 CAMLprim value ml_aeron_subscription_constants(value ba) {
     CAMLparam1(ba);
-    CAMLlocal1(x);
+    CAMLlocal2(x, v);
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     aeron_subscription_constants_t consts;
     int ret = aeron_subscription_constants(sub->sub, &consts);
@@ -492,25 +492,67 @@ CAMLprim value ml_aeron_subscription_constants(value ba) {
         caml_failwith(aeron_errmsg());
 
     x = caml_alloc_tuple(3);
-    Store_field(x, 0, caml_copy_int64(consts.registration_id));
-    Store_field(x, 1, caml_copy_int32(consts.stream_id));
-    Store_field(x, 2, caml_copy_int32(consts.channel_status_indicator_id));
+    /* Every boxed field is built into a registered local first: see
+     * ml_alloc_publication_consts below for why Store_field(x, i,
+     * caml_copy_*(...)) is not safe. */
+    v = caml_copy_int64(consts.registration_id);
+    Store_field(x, 0, v);
+    v = caml_copy_int32(consts.stream_id);
+    Store_field(x, 1, v);
+    v = caml_copy_int32(consts.channel_status_indicator_id);
+    Store_field(x, 2, v);
     CAMLreturn(x);
 }
 
+/* Every field here is a *boxed* value, so filling the tuple means allocating
+ * twelve times while holding a pointer to it.
+ *
+ * `Store_field(x, i, caml_copy_int32(v))` is the wrong way to do that, even
+ * though it reads like the obvious one. Store_field expands to
+ * caml_modify(&Field(x, i), ...), and C does not order the evaluation of the
+ * two arguments: the address &Field(x, i) is typically computed first, then
+ * caml_copy_int32 runs, allocates, and can trigger a minor collection that
+ * promotes x -- after which caml_modify writes the new value through the
+ * address x used to live at. The tuple keeps whatever the minor heap left in
+ * that slot, and the OCaml side reads a field that was never initialised.
+ *
+ * That is not theoretical: it landed as an immediate 0 in `session_id`, and a
+ * publisher comparing it with Int32.equal dereferenced it and took SIGSEGV.
+ * It is intermittent by nature -- it needs that particular allocation to be
+ * the one that trips a minor GC -- so it stayed hidden until a caller started
+ * reading the constants on every published batch.
+ *
+ * Hoisting each allocation into a registered local fixes it: the value exists
+ * before Store_field is called, and x is re-read after any collection the
+ * allocation caused. */
 void ml_alloc_publication_consts(value x, aeron_publication_constants_t *consts) {
-    Store_field(x, 0, caml_copy_int64(consts->original_registration_id));
-    Store_field(x, 1, caml_copy_int64(consts->registration_id));
-    Store_field(x, 2, caml_copy_int64(consts->max_possible_position));
-    Store_field(x, 3, caml_copy_int64(consts->position_bits_to_shift));
-    Store_field(x, 4, caml_copy_int64(consts->term_buffer_length));
-    Store_field(x, 5, caml_copy_int64(consts->max_message_length));
-    Store_field(x, 6, caml_copy_int64(consts->max_payload_length));
-    Store_field(x, 7, caml_copy_int32(consts->stream_id));
-    Store_field(x, 8, caml_copy_int32(consts->session_id));
-    Store_field(x, 9, caml_copy_int32(consts->initial_term_id));
-    Store_field(x, 10, caml_copy_int32(consts->publication_limit_counter_id));
-    Store_field(x, 11, caml_copy_int32(consts->channel_status_indicator_id));
+    CAMLparam1(x);
+    CAMLlocal1(v);
+    v = caml_copy_int64(consts->original_registration_id);
+    Store_field(x, 0, v);
+    v = caml_copy_int64(consts->registration_id);
+    Store_field(x, 1, v);
+    v = caml_copy_int64(consts->max_possible_position);
+    Store_field(x, 2, v);
+    v = caml_copy_int64(consts->position_bits_to_shift);
+    Store_field(x, 3, v);
+    v = caml_copy_int64(consts->term_buffer_length);
+    Store_field(x, 4, v);
+    v = caml_copy_int64(consts->max_message_length);
+    Store_field(x, 5, v);
+    v = caml_copy_int64(consts->max_payload_length);
+    Store_field(x, 6, v);
+    v = caml_copy_int32(consts->stream_id);
+    Store_field(x, 7, v);
+    v = caml_copy_int32(consts->session_id);
+    Store_field(x, 8, v);
+    v = caml_copy_int32(consts->initial_term_id);
+    Store_field(x, 9, v);
+    v = caml_copy_int32(consts->publication_limit_counter_id);
+    Store_field(x, 10, v);
+    v = caml_copy_int32(consts->channel_status_indicator_id);
+    Store_field(x, 11, v);
+    CAMLreturn0;
 }
 
 CAMLprim value ml_aeron_publication_constants(value pub) {
