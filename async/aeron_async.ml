@@ -574,10 +574,114 @@ let close_subscription t x =
 
 let is_connected { sub; _ } = Subscription.is_connected sub
 
+(* One poll loop drives every subscription in the process.
+
+   An Aeron subscription is shared memory with no file descriptor behind
+   it, so the only way to drain one is to poll it on a timer. Giving each
+   its own [Clock_ns.after] loop makes that cost scale with the number of
+   subscriptions rather than with the traffic: the rftp bridge, on 31
+   streams, re-armed 31 timers every millisecond, and the resulting timing
+   wheel churn -- an insert, a fire and a remove per subscription per
+   period, each arming costing a [clock_gettime] and the wheel a
+   [timerfd_settime] -- came to about a third of the process's cycles
+   while over 99% of those polls returned no fragment at all.
+
+   So: one timer for all of them, polling every subscription per pass.
+
+   What this loop must NOT do is poll harder than the reader drains.
+   [Subscription.poll] delivers each fragment to a C callback that writes
+   it into the pipe this subscription is read through, with the runtime
+   lock held and the write blocking; the only thing that can empty that
+   pipe is the Async reader on this same thread. So a poll that overruns
+   the pipe deadlocks the process against itself, permanently. That is why
+   [max_fragments] is small (see [start_polling_subscription]) and why
+   there is no re-poll-immediately fast path here: the fragment limit
+   bounds a single poll, and the period bounds how fast polls can follow
+   one another, and both bounds are what keep the pipe from filling. *)
+module Poller = struct
+  type status =
+    | Continue (** keep polling this subscription *)
+    | Finished (** this subscription is done with; drop it *)
+
+  type entry =
+    { poll : unit -> status
+    ; period : Time_ns.Span.t
+    ; mutable alive : bool
+    }
+
+  let entries : entry list ref = ref []
+  let running = ref false
+  let period = ref (Time_ns.Span.of_int_ms 1)
+
+  (* Filled to cut an idle short, so that a subscription registering
+     against a loop part-way through someone else's longer period is
+     polled at its own from the start rather than after that period. *)
+  let wake = ref (Ivar.create ())
+
+  (* The loop idles for the shortest period any live subscription asked
+     for, so one that wants to be polled faster speeds it up for everyone
+     rather than being held to someone else's period -- and retiring that
+     subscription lets it settle back. *)
+  let recompute_period () =
+    match !entries with
+    | [] -> ()
+    | e :: es ->
+      period := List.fold es ~init:e.period ~f:(fun a e -> Time_ns.Span.min a e.period)
+  ;;
+
+  let sweep () =
+    entries := List.filter !entries ~f:(fun e -> e.alive);
+    recompute_period ()
+  ;;
+
+  let idle () = Deferred.any [ Clock_ns.after !period; Ivar.read !wake ]
+
+  let rec cycle () =
+    let died = ref false in
+    (* A poll can retire its own entry, and through [on_fatal] another
+       one, so walk the list captured at the top of the pass and sweep the
+       dead out afterwards. *)
+    List.iter !entries ~f:(fun e ->
+      if e.alive
+      then (
+        match e.poll () with
+        | Continue -> ()
+        | Finished ->
+          e.alive <- false;
+          died := true));
+    if !died then sweep ();
+    (* Park as soon as the last subscription goes, rather than idling out
+       one more period first: [register] restarts the loop. *)
+    if List.is_empty !entries
+    then (
+      running := false;
+      Deferred.unit)
+    else idle () >>= cycle
+  ;;
+
+  let register ~period poll =
+    entries := { poll; period; alive = true } :: !entries;
+    recompute_period ();
+    if !running
+    then (
+      Ivar.fill_if_empty !wake ();
+      wake := Ivar.create ())
+    else (
+      running := true;
+      don't_wait_for (cycle ()))
+  ;;
+end
+
 let start_polling_subscription
       ?(stop = Deferred.never ())
       ?(period = Time_ns.Span.of_int_ms 1)
-      ?(max_fragments = 10)
+      (* Bounded by the pipe, not by throughput: [poll_handler] writes every
+         fragment into a 64K pipe with a blocking write, holding the runtime
+         lock, so one poll's worth of fragments has to fit or the thread
+         blocks against the reader that would drain it and never wakes. Ten
+         fragments against the 4K read buffer below leaves most of the pipe
+         spare; 128 does not, and hung the rftp bridge on the first burst. *)
+        ?(max_fragments = 10)
       ?(on_fatal = ignore)
       (sub : subscription)
       f
@@ -589,25 +693,28 @@ let start_polling_subscription
        close_subscription_aux sub
        >>| fun () -> Lo.debug (fun m -> m "Closed subscription"))
   in
-  (* Launch polling loop. *)
-  don't_wait_for
-    (let rec loop () =
-       if Reader.is_closed sub.r
-       then Deferred.unit
-       else (
-         match Aeron.Subscription.poll_exn sub.sub max_fragments with
-         | exception exn ->
-           Lo.err (fun m -> m "%s" (Exn.to_string exn));
-           (* Let the caller know this subscription is dead beyond this
-              point -- e.g. so a [Persistent] subscription notices and
-              re-subscribes -- before tearing it down. *)
-           on_fatal exn;
-           Lazy.force close_sub
-         | _nb_frags when Deferred.is_determined stop -> Lazy.force close_sub
-         | _ -> Clock_ns.after period >>= loop)
-     in
-     loop ());
-  let bbuf = Bigbuffer.create 4096 in
+  (* Join the shared poll loop. *)
+  Poller.register ~period (fun () ->
+    if Reader.is_closed sub.r
+    then Poller.Finished
+    else (
+      match Aeron.Subscription.poll_exn sub.sub max_fragments with
+      | exception exn ->
+        Lo.err (fun m -> m "%s" (Exn.to_string exn));
+        (* Let the caller know this subscription is dead beyond this
+           point -- e.g. so a [Persistent] subscription notices and
+           re-subscribes -- before tearing it down. *)
+        on_fatal exn;
+        don't_wait_for (Lazy.force close_sub);
+        Poller.Finished
+      | _nb_frags when Deferred.is_determined stop ->
+        don't_wait_for (Lazy.force close_sub);
+        Poller.Finished
+      | _nb_frags -> Poller.Continue));
+  (* A subscription may merge several publication sessions on one stream.
+     Their fragmented messages can interleave, so one shared assembly buffer
+     corrupts both messages. Keep assembly state per Aeron session. *)
+  let fragmented = Int32.Table.create () in
   let hdr = Bigstring.create Header.sizeof_values in
   let shdr = Bigsubstring.create hdr in
   let buf = Bigstring.create 4096 in
@@ -638,17 +745,21 @@ let start_polling_subscription
             loop ()
           | 2 ->
             (* first frame *)
+            let bbuf = Bigbuffer.create (Int.max 4096 len) in
             Bigbuffer.clear bbuf;
             Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            Hashtbl.set fragmented ~key:h.frame.session_id ~data:bbuf;
             loop ()
           | 0 ->
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+            Option.iter (Hashtbl.find fragmented h.frame.session_id) ~f:(fun bbuf ->
+              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len));
             loop ()
           | _ ->
             (* last frame *)
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            let len = Bigbuffer.length bbuf in
-            f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len);
+            Option.iter (Hashtbl.find_and_remove fragmented h.frame.session_id) ~f:(fun bbuf ->
+              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
+              let len = Bigbuffer.length bbuf in
+              f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len));
             loop ()))
   in
   loop ()

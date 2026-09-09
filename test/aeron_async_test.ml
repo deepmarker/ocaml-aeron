@@ -57,6 +57,86 @@ let test_gives_up_on_an_unresponsive_driver () =
     check bool "bounded by the timeout" true Time_ns.Span.(waited < span 5_000)
 ;;
 
+
+(* The shared poll loop. Every subscription in a process is drained by
+   this one loop rather than by a timer each, and it only idles when a
+   pass came back with nothing -- see [Aeron_async.add_subscription]. *)
+module Poller = Aeron_async.Poller
+
+let after_ms n = Clock_ns.after (span n)
+
+(* An idle subscription costs one poll per period, no matter how busy the
+   scheduler is around it. *)
+let test_idle_polls_once_per_period () =
+  let polls = ref 0 in
+  let stop = ref false in
+  Poller.register ~period:(span 10) (fun () ->
+    incr polls;
+    if !stop then Poller.Finished else Poller.Continue);
+  after_ms 100
+  >>| fun () ->
+  stop := true;
+  check bool "polled" true (!polls > 2);
+  (* 100ms of 10ms periods is ~10 passes. A loop that re-ran every
+     scheduler cycle instead would be in the thousands. *)
+  check bool "did not spin" true (!polls < 60)
+;;
+
+(* The loop must never poll faster than its period, however much there is
+   to read. Fragments reach OCaml through a 64K pipe that a blocking C
+   callback fills while holding the runtime lock, and the only reader is
+   the Async thread running this loop -- so a loop that re-polls without
+   idling can overrun the pipe and deadlock the process against itself.
+   That is not hypothetical: it hung the rftp bridge on its first burst. *)
+let test_never_polls_faster_than_its_period () =
+  let polls = ref 0 in
+  let stop = ref false in
+  Poller.register ~period:(span 20) (fun () ->
+    incr polls;
+    if !stop then Poller.Finished else Poller.Continue);
+  after_ms 200
+  >>| fun () ->
+  stop := true;
+  (* 200ms of 20ms periods is ~10 passes, whatever the polls report. *)
+  check bool "polled" true (!polls > 3);
+  check bool "did not outrun the period" true (!polls < 30)
+;;
+
+(* Registrants share the loop, so N subscriptions cost N polls per period
+   rather than N timers. *)
+let test_registrants_share_one_loop () =
+  let polls = Array.create ~len:5 0 in
+  let stop = ref false in
+  Array.iteri polls ~f:(fun i _ ->
+    Poller.register ~period:(span 10) (fun () ->
+      polls.(i) <- polls.(i) + 1;
+      if !stop then Poller.Finished else Poller.Continue));
+  after_ms 100
+  >>| fun () ->
+  stop := true;
+  let lo = Array.min_elt polls ~compare |> Option.value_exn in
+  let hi = Array.max_elt polls ~compare |> Option.value_exn in
+  check bool "all were polled" true (lo > 2);
+  check bool "in lockstep, on one timer" true (hi - lo <= 1)
+;;
+
+(* A finished subscription stops being polled, and the loop parks once the
+   last one goes. *)
+let test_finished_is_dropped () =
+  let live = ref 0 in
+  let dead = ref 0 in
+  Poller.register ~period:(span 10) (fun () ->
+    incr dead;
+    Poller.Finished);
+  Poller.register ~period:(span 10) (fun () ->
+    incr live;
+    Poller.Continue);
+  after_ms 100
+  >>| fun () ->
+  check int "polled once, then dropped" 1 !dead;
+  check bool "the other kept going" true (!live > 2)
+;;
+
 let () =
   Async.Thread_safe.block_on_async_exn (fun () ->
     run
@@ -68,6 +148,14 @@ let () =
               "gives up on an unresponsive driver"
               `Quick
               test_gives_up_on_an_unresponsive_driver
+          ] )
+      ; ( "shared poller"
+        , [ test_case "an idle subscription polls once per period" `Quick
+              test_idle_polls_once_per_period
+          ; test_case "never polls faster than its period" `Quick
+              test_never_polls_faster_than_its_period
+          ; test_case "registrants share one loop" `Quick test_registrants_share_one_loop
+          ; test_case "a finished subscription is dropped" `Quick test_finished_is_dropped
           ] )
       ])
 ;;

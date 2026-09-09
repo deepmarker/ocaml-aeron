@@ -19,6 +19,17 @@ val poll_until
   -> (unit -> 'a option)
   -> 'a Deferred.Or_error.t
 
+(** The single loop that drains every subscription in the process; see
+    [add_subscription]. Exposed so its idling can be tested without a live
+    driver -- there is no reason to register with it directly. *)
+module Poller : sig
+  type status =
+    | Continue (** keep polling this subscription *)
+    | Finished (** this subscription is done with; drop it *)
+
+  val register : period:Time_ns.Span.t -> (unit -> status) -> unit
+end
+
 (** [is_driver_active ?timeout_ms dir] checks [dir] for a live media
     driver's cnc.dat heartbeat without opening a client against it -- e.g.
     to back off a reconnect loop before [create], or for a health check
@@ -65,6 +76,16 @@ val do_work_exn : t -> unit
 
 type subscription
 
+(** Every subscription in the process is drained by one shared poll loop,
+    not by a timer of its own. [period] (default 1ms) is how long that loop
+    idles between passes; the loop as a whole runs at the shortest period
+    any live subscription asked for.
+
+    [max_fragments] (default 10) is a safety bound, not a tuning knob:
+    fragments reach OCaml through a 64K pipe written by a blocking C
+    callback that holds the runtime lock, so a poll delivering more than
+    the pipe can hold deadlocks the process against its own reader. Raise
+    it only against that budget. *)
 val add_subscription
   :  ?stop:_ Deferred.t
   -> ?period:Time_ns.Span.t
