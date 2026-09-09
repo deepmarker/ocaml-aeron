@@ -271,9 +271,14 @@ end
 module Concurrent = MkPublication (MkAsyncPublication (Publication))
 module Exclusive = MkPublication (MkAsyncPublication (ExclusivePublication))
 
+(* [buf] is where [Subscription.poll_exn] deposits fragments. C holds a
+   borrowed pointer to it for the life of the subscription, so this record
+   is what keeps it alive; [closed] is set once the subscription is torn
+   down, after which nothing may poll into that buffer again. *)
 type subscription =
   { sub : Subscription.t
-  ; r : Reader.t
+  ; buf : Bigstring.t
+  ; mutable closed : bool
   }
 [@@deriving fields]
 
@@ -374,7 +379,9 @@ let close { client; ctx; pubs; stop; subs; _ } =
     let subs = Hashtbl.to_alist subs in
     Monitor.protect
       (fun () ->
-         Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, { r; _ }) -> Reader.close r)
+         Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, s) ->
+           s.closed <- true;
+           Deferred.unit)
          >>= fun () ->
          Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P x) ->
            match x with
@@ -556,16 +563,17 @@ let add_exclusive_publication ({ client; pubs; stop; _ } as t) chan ~streamID en
   Exclusive x, consts
 ;;
 
-let close_subscription_aux { sub; r } =
+let close_subscription_aux ({ sub; _ } as t) =
+  (* Marked closed first: the poll loop must not deposit another fragment
+     into [buf] once the C side is being torn down under it. *)
+  t.closed <- true;
   Subscription.close sub;
   poll_until ~what:"close subscription" (fun () ->
     Option.some_if (Subscription.is_closed sub) ())
-  >>= fun res ->
-  (match res with
-   | Ok () -> ()
-   | Error err -> Lo.err (fun m -> m "%a" Error.pp err));
-  (* cleanup regardless: the reader is ours to close. *)
-  Reader.close r
+  >>| fun res ->
+  match res with
+  | Ok () -> ()
+  | Error err -> Lo.err (fun m -> m "%a" Error.pp err)
 ;;
 
 let close_subscription t x =
@@ -648,6 +656,14 @@ module Poller = struct
         | Continue -> ()
         | Finished ->
           e.alive <- false;
+          died := true
+        | exception exn ->
+          (* Delivery runs inside this loop, so a handler that raises would
+             otherwise take down every other subscription in the process
+             along with its own. Drop the one that raised and carry on. *)
+          Lo.err (fun m ->
+            m "aeron: dropping a subscription whose poll raised: %s" (Exn.to_string exn));
+          e.alive <- false;
           died := true));
     if !died then sweep ();
     (* Park as soon as the last subscription goes, rather than idling out
@@ -675,12 +691,10 @@ end
 let start_polling_subscription
       ?(stop = Deferred.never ())
       ?(period = Time_ns.Span.of_int_ms 1)
-      (* Bounded by the pipe, not by throughput: [poll_handler] writes every
-         fragment into a 64K pipe with a blocking write, holding the runtime
-         lock, so one poll's worth of fragments has to fit or the thread
-         blocks against the reader that would drain it and never wakes. Ten
-         fragments against the 4K read buffer below leaves most of the pipe
-         spare; 128 does not, and hung the rftp bridge on the first burst. *)
+      (* How much of [buffer_size] one pass may fill. Neither bound is a
+         correctness constraint any more -- a fragment that will not fit is
+         declined and redelivered, not dropped and not blocked on -- so
+         these only decide how much work a pass does. *)
         ?(max_fragments = 10)
       ?(on_fatal = ignore)
       (sub : subscription)
@@ -693,12 +707,57 @@ let start_polling_subscription
        close_subscription_aux sub
        >>| fun () -> Lo.debug (fun m -> m "Closed subscription"))
   in
-  (* Join the shared poll loop. *)
+  (* A subscription may merge several publication sessions on one stream.
+     Their fragmented messages can interleave, so one shared assembly buffer
+     corrupts both messages. Keep assembly state per Aeron session. *)
+  let fragmented = Int32.Table.create () in
+  let hdr_len = Header.sizeof_values in
+  (* Walk what the poll just deposited into [sub.buf]: each fragment is an
+     [aeron_header_values_t] followed immediately by its payload, back to
+     back, for [written] bytes. No copy and no syscall -- the C handler put
+     it straight there, which is the point of not going through a pipe. *)
+  let drain written =
+    let rec go pos =
+      if pos < written
+      then (
+        let h = Header.of_cstruct (Cstruct.of_bigarray sub.buf ~off:pos ~len:hdr_len) in
+        let len = Int32.to_int_exn h.frame.frame_length - 32 in
+        let pos = pos + hdr_len in
+        (match h.frame.flags lsr 6 with
+         | 3 ->
+           (* unique frame *)
+           f (Iobuf.of_bigstring sub.buf ~pos ~len)
+         | 2 ->
+           (* first frame *)
+           let bbuf = Bigbuffer.create (Int.max 4096 len) in
+           Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~pos ~len);
+           Hashtbl.set fragmented ~key:h.frame.session_id ~data:bbuf
+         | 0 ->
+           Option.iter (Hashtbl.find fragmented h.frame.session_id) ~f:(fun bbuf ->
+             Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~pos ~len))
+         | _ ->
+           (* last frame *)
+           Option.iter (Hashtbl.find_and_remove fragmented h.frame.session_id)
+             ~f:(fun bbuf ->
+               Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared sub.buf ~pos ~len);
+               let len = Bigbuffer.length bbuf in
+               f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len)));
+        go (pos + len))
+    in
+    go 0
+  in
+  (* Join the shared poll loop. Polling and delivery are one step now: [f]
+     runs here, between the poll that filled the buffer and the next one
+     that would overwrite it. *)
   Poller.register ~period (fun () ->
-    if Reader.is_closed sub.r
+    if sub.closed
     then Poller.Finished
     else (
-      match Aeron.Subscription.poll_exn sub.sub max_fragments with
+      match
+        let nb = Aeron.Subscription.poll_exn sub.sub max_fragments in
+        if nb > 0 then drain (Aeron.Subscription.polled_bytes sub.sub);
+        nb
+      with
       | exception exn ->
         Lo.err (fun m -> m "%s" (Exn.to_string exn));
         (* Let the caller know this subscription is dead beyond this
@@ -707,84 +766,40 @@ let start_polling_subscription
         on_fatal exn;
         don't_wait_for (Lazy.force close_sub);
         Poller.Finished
-      | _nb_frags when Deferred.is_determined stop ->
+      | _nb when Deferred.is_determined stop ->
         don't_wait_for (Lazy.force close_sub);
         Poller.Finished
-      | _nb_frags -> Poller.Continue));
-  (* A subscription may merge several publication sessions on one stream.
-     Their fragmented messages can interleave, so one shared assembly buffer
-     corrupts both messages. Keep assembly state per Aeron session. *)
-  let fragmented = Int32.Table.create () in
-  let hdr = Bigstring.create Header.sizeof_values in
-  let shdr = Bigsubstring.create hdr in
-  let buf = Bigstring.create 4096 in
-  (* Read data from the C callback via a fd/Reader.t *)
-  let rec loop () =
-    (* read hdr *)
-    Reader.really_read_bigsubstring sub.r shdr
-    >>= function
-    | `Eof _ ->
-      (* TODO: ok? *)
-      Deferred.unit
-    | `Ok ->
-      let h = Header.of_cstruct (Cstruct.of_bigarray hdr) in
-      let len = Int32.to_int_exn h.frame.frame_length - 32 in
-      (* now read len bytes of payload *)
-      Lo.debug (fun m -> m "Read %d bytes from sub" len);
-      Reader.really_read_bigsubstring sub.r (Bigsubstring.create buf ~len)
-      >>= (function
-       | `Eof _ ->
-         (* TODO: ok? *)
-         Deferred.unit
-       | `Ok ->
-         (* Lo.debug (fun m -> m "%a" Cstruct.hexdump_pp (Cstruct.of_bigarray buf ~len)); *)
-         (match h.frame.flags lsr 6 with
-          | 3 ->
-            (* unique frame *)
-            f (Iobuf.of_bigstring buf ~len);
-            loop ()
-          | 2 ->
-            (* first frame *)
-            let bbuf = Bigbuffer.create (Int.max 4096 len) in
-            Bigbuffer.clear bbuf;
-            Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-            Hashtbl.set fragmented ~key:h.frame.session_id ~data:bbuf;
-            loop ()
-          | 0 ->
-            Option.iter (Hashtbl.find fragmented h.frame.session_id) ~f:(fun bbuf ->
-              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len));
-            loop ()
-          | _ ->
-            (* last frame *)
-            Option.iter (Hashtbl.find_and_remove fragmented h.frame.session_id) ~f:(fun bbuf ->
-              Bigbuffer.add_bigstring bbuf (Bigstring.sub_shared buf ~len);
-              let len = Bigbuffer.length bbuf in
-              f (Iobuf.of_bigstring (Bigbuffer.volatile_contents bbuf) ~len));
-            loop ()))
-  in
-  loop ()
+      | _nb -> Poller.Continue))
 ;;
 
-let add_subscription ?stop ?period ?max_fragments ?on_fatal t uri ~streamID f =
+let add_subscription
+      ?stop
+      ?period
+      ?(buffer_size = 64 * 1024)
+      ?max_fragments
+      ?on_fatal
+      t
+      uri
+      ~streamID
+      f
+  =
   if Ivar.is_full t.stop then raise Stopped;
-  Unix.pipe (Info.of_string "Aeron_async.add_subscription")
-  >>= fun (`Reader rfd, `Writer wfd) ->
   let sub_req = Aeron.Subscription.add t.client uri streamID in
-  let wfd_raw = Fd.to_int_exn wfd in
+  (* Handed to C, which keeps a borrowed pointer to it; [subscription] holds
+     it live from here on. It has to be at least one MTU plus a header, or
+     no fragment can ever fit and [poll_exn] says so rather than livelocking. *)
+  let buf = Bigstring.create buffer_size in
   (* Bounded for the same reason publication's [add] is (see [poll_until]):
      a driver that has stopped answering must not turn this into an
      unbounded wait. *)
-  poll_until ~what:"add subscription" (fun () ->
-    Aeron.Subscription.add_poll sub_req wfd_raw)
+  poll_until ~what:"add subscription" (fun () -> Aeron.Subscription.add_poll sub_req buf)
   >>= function
-  | Error _ as e -> Fd.close rfd >>= fun () -> Fd.close wfd >>| fun () -> e
+  | Error _ as e -> return e
   | Ok sub ->
     let consts = Subscription.consts sub in
-    let r = Reader.create rfd in
-    let sub = Fields_of_subscription.create ~sub ~r in
+    let sub = Fields_of_subscription.create ~sub ~buf ~closed:false in
     Hashtbl.set t.subs ~key:consts.registration_id ~data:sub;
-    don't_wait_for
-      (start_polling_subscription ?stop ?period ?max_fragments ?on_fatal sub f);
+    start_polling_subscription ?stop ?period ?max_fragments ?on_fatal sub f;
     Deferred.Or_error.return (sub, consts)
 ;;
 

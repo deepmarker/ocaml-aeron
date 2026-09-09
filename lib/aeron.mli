@@ -133,7 +133,11 @@ module Subscription : sig
   [@@deriving sexp]
 
   val add : conn -> Uri.t -> int32 -> add
-  val add_poll : add -> int -> t option
+
+  (** [add_poll add data] completes the subscription and points it at [data],
+      the buffer [poll_exn] deposits fragments into. C borrows that buffer for
+      the life of the subscription, so the caller must keep it reachable. *)
+  val add_poll : add -> Bigstringaf.t -> t option
   val close : t -> unit
   val is_closed : t -> bool
   val is_connected : t -> bool
@@ -143,7 +147,20 @@ module Subscription : sig
   val status : t -> int
 
   val consts : t -> consts
+
+  (** [poll_exn t limit] takes up to [limit] fragments into the buffer given
+      to [add_poll] -- each an [aeron_header_values_t] then its payload --
+      and answers how many it took. A fragment that will not fit is left
+      unconsumed and redelivered by the next poll, so a short answer means
+      "drain and call again", never a loss.
+
+      Raises if one fragment could not fit an empty buffer, which is
+      otherwise a silent livelock; that means the buffer is smaller than
+      [aeron.mtu.length]. *)
   val poll_exn : t -> int -> int
+
+  (** Bytes the last [poll_exn] wrote: how much of the buffer to walk. *)
+  val polled_bytes : t -> int
 end
 
 module Publication : Publication_sig

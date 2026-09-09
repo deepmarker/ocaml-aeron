@@ -1,5 +1,6 @@
 #include "caml/mlvalues.h"
 #include <endian.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -446,14 +447,35 @@ CAMLprim value ml_aeron_async_add_subscription (value client, value uri, value s
     CAMLreturn(Val_ptr(sub));
 }
 
+// Fragments do not go through a pipe, unlike the error/close channel
+// above. [forward_errors] and [forward_close] are called by Aeron's own
+// conductor thread, which does not hold the OCaml runtime lock, so a raw
+// fd is the only thing they may touch. A fragment handler is not that
+// kind of callback: it is a visitor, run synchronously inside the
+// [aeron_subscription_controlled_poll] call that OCaml itself made, on
+// OCaml's own thread, with the lock still held. So it can copy straight
+// into a Bigstring OCaml owns -- off-heap, never moved by the GC, and
+// held live by the [subscription] record for as long as the subscription.
+//
+// Doing that through a pipe deadlocked: the writes blocked once the pipe
+// filled, and the only reader was the very thread stuck inside the poll.
 struct ml_aeron_sub {
-    int fd;
     aeron_subscription_t *sub;
+    uint8_t *buf;      // borrowed from OCaml, alive as long as the subscription
+    size_t buf_len;
+    size_t written;    // bytes filled by the poll in progress
+    size_t overflow;   // a fragment too big for [buf] at all, else 0
 };
 
-CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba) {
+CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba, value data) {
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     int ret = aeron_async_add_subscription_poll(&sub->sub, Ptr_val(async));
+    if (ret == 1) {
+        sub->buf = Caml_ba_data_val(data);
+        sub->buf_len = Caml_ba_array_val(data)->dim[0];
+        sub->written = 0;
+        sub->overflow = 0;
+    }
     return Val_int(ret);
 }
 
@@ -581,42 +603,76 @@ CAMLprim value ml_aeron_excl_publication_constants(value pub) {
     CAMLreturn(x);
 }
 
-void poll_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header) {
+// Appends [header][payload] to the subscription's buffer, and declines the
+// fragment when there is no room.
+//
+// AERON_ACTION_ABORT is what makes that safe: it ends the poll *without*
+// advancing the read position past this fragment, so the same fragment is
+// redelivered by the next poll once OCaml has drained the buffer. Nothing
+// is lost and nothing half-written has to be remembered. That is the whole
+// reason for [aeron_subscription_controlled_poll] over the plain
+// [aeron_subscription_poll]: the plain handler returns void and so has no
+// way to say "not this one, not yet".
+static aeron_controlled_fragment_handler_action_t poll_handler(
+    void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header) {
     if (clientd == NULL) {
-        return; // No client data, cannot continue
+        return AERON_ACTION_ABORT;
     }
     struct ml_aeron_sub *sub = clientd;
+    size_t need = sizeof(aeron_header_values_t) + length;
+
+    // Too big for an *empty* buffer: redelivering it forever would be a
+    // silent livelock, so record it for [ml_aeron_subscription_poll] to
+    // raise on once it sees the buffer could not be drained any further.
+    if (need > sub->buf_len) {
+        sub->overflow = need;
+        return AERON_ACTION_ABORT;
+    }
+    if (sub->written + need > sub->buf_len) {
+        return AERON_ACTION_ABORT;
+    }
 
     aeron_header_values_t values;
-    int ret = aeron_header_values(header, &values);
-    if (ret < 0) {
-        // Handle error - log or report it
-        return;
+    if (aeron_header_values(header, &values) < 0) {
+        return AERON_ACTION_ABORT;
     }
 
-    // Write header values
-    if (write_all(sub->fd, &values, sizeof(aeron_header_values_t)) != sizeof(aeron_header_values_t)) {
-        // Handle error
-        return;
-    }
-
-    // Write buffer content
-    if (write_all(sub->fd, buffer, length) != length) {
-        // Handle error
-        return;
-    }
+    memcpy(sub->buf + sub->written, &values, sizeof(values));
+    sub->written += sizeof(values);
+    memcpy(sub->buf + sub->written, buffer, length);
+    sub->written += length;
+    return AERON_ACTION_CONTINUE;
 }
 
 CAMLprim value ml_aeron_subscription_poll(value ba, value limit) {
     CAMLparam2(ba, limit);
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
-    int nb_read = aeron_subscription_poll(sub->sub,
-                                          poll_handler,
-                                          sub,
-                                          Long_val(limit));
+    sub->written = 0;
+    sub->overflow = 0;
+    int nb_read = aeron_subscription_controlled_poll(sub->sub,
+                                                     poll_handler,
+                                                     sub,
+                                                     Long_val(limit));
     if (nb_read < 0)
         caml_failwith(aeron_errmsg());
+    // Only fatal if the buffer was empty and the fragment still would not
+    // fit; otherwise there is simply draining to do first.
+    if (sub->overflow != 0 && sub->written == 0) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "aeron: a %zu byte fragment does not fit the %zu byte subscription "
+                 "buffer; raise it or lower aeron.mtu.length",
+                 sub->overflow, sub->buf_len);
+        caml_failwith(msg);
+    }
     CAMLreturn(Val_int(nb_read));
+}
+
+// Bytes [poll] just appended, i.e. how much of the buffer OCaml should
+// now walk.
+CAMLprim value ml_aeron_subscription_polled_bytes(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return Val_long(sub->written);
 }
 
 CAMLprim value alloc_claim(value unit) {

@@ -81,14 +81,21 @@ type subscription
     idles between passes; the loop as a whole runs at the shortest period
     any live subscription asked for.
 
-    [max_fragments] (default 10) is a safety bound, not a tuning knob:
-    fragments reach OCaml through a 64K pipe written by a blocking C
-    callback that holds the runtime lock, so a poll delivering more than
-    the pipe can hold deadlocks the process against its own reader. Raise
-    it only against that budget. *)
+    Fragments are copied straight into a [buffer_size] (default 64K)
+    Bigstring owned by this subscription and handed to [f] from the poll
+    loop itself, with no pipe and no syscall in between. [max_fragments]
+    (default 10) caps how many one pass takes. Neither bound is a
+    correctness constraint: a fragment that will not fit the buffer is
+    declined rather than dropped or blocked on, and comes back on the next
+    pass, so both only decide how much work a pass does.
+
+    [buffer_size] must be at least one [aeron.mtu.length] plus a fragment
+    header, since otherwise no fragment can ever fit; that is reported as
+    an error rather than looping forever. *)
 val add_subscription
   :  ?stop:_ Deferred.t
   -> ?period:Time_ns.Span.t
+  -> ?buffer_size:int
   -> ?max_fragments:int
   -> ?on_fatal:(exn -> unit)
        (** called if the poll loop dies mid-life, before it closes. *)

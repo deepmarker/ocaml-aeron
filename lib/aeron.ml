@@ -291,17 +291,23 @@ module Subscription = struct
   external add : conn -> string -> int32 -> add = "ml_aeron_async_add_subscription"
 
   (* -1 = error, 0 = try again, 1 = success *)
-  external add_poll : add -> Bigstringaf.t -> int = "ml_aeron_async_add_subscription_poll"
+  external add_poll
+    :  add
+    -> Bigstringaf.t
+    -> Bigstringaf.t
+    -> int
+    = "ml_aeron_async_add_subscription_poll"
 
-  let add_poll add fd =
-    let buf = Bigstringaf.create (2 * Sys.word_size / 8) in
-    (match Sys.word_size, Sys.big_endian with
-     | 32, true -> Bigstringaf.set_int32_be buf 0 (Int32.of_int fd)
-     | 32, false -> Bigstringaf.set_int32_le buf 0 (Int32.of_int fd)
-     | 64, true -> Bigstringaf.set_int64_be buf 0 (Int64.of_int fd)
-     | 64, false -> Bigstringaf.set_int64_le buf 0 (Int64.of_int fd)
-     | _ -> assert false);
-    match add_poll add buf with
+  (* [data] is where [poll] deposits fragments. C keeps a borrowed pointer
+     to it for the life of the subscription, so the caller has to hold on
+     to it -- a Bigstring is off-heap and never moved by the GC, but it is
+     still freed when nothing references it. *)
+  let add_poll add data =
+    (* Five words: the subscription pointer, then [data]'s address and
+       length, then the poll's byte count and overflow flag. C fills all of
+       them; see [struct ml_aeron_sub]. *)
+    let buf = Bigstringaf.create (5 * Sys.word_size / 8) in
+    match add_poll add buf data with
     | -1 -> failwith (errmsg ())
     | 0 -> None
     | 1 -> Some buf
@@ -320,7 +326,17 @@ module Subscription = struct
 
   external status : Bigstringaf.t -> int = "ml_aeron_subscription_channel_status"
   external consts : Bigstringaf.t -> consts = "ml_aeron_subscription_constants"
+  (* Fills the buffer given to [add_poll] with up to [limit] fragments, each
+     an [aeron_header_values_t] followed by its payload, and answers how many
+     it took. A fragment that does not fit is left unconsumed and comes back
+     on the next poll (AERON_ACTION_ABORT), so a short return means "drain
+     and call again", never a loss. Raises only if a single fragment could
+     not fit an empty buffer. *)
   external poll_exn : Bigstringaf.t -> int -> int = "ml_aeron_subscription_poll"
+
+  (* Bytes the last [poll_exn] wrote, i.e. how much of the buffer to walk. *)
+  external polled_bytes : Bigstringaf.t -> int = "ml_aeron_subscription_polled_bytes"
+  [@@noalloc]
 end
 
 external alloc_claim : unit -> claim = "alloc_claim"
