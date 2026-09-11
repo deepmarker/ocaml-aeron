@@ -271,14 +271,13 @@ end
 module Concurrent = MkPublication (MkAsyncPublication (Publication))
 module Exclusive = MkPublication (MkAsyncPublication (ExclusivePublication))
 
-(* [buf] is where [Subscription.poll_exn] deposits fragments. C holds a
-   borrowed pointer to it for the life of the subscription, so this record
-   is what keeps it alive; [closed] is set once the subscription is torn
-   down, after which nothing may poll into that buffer again. *)
+(* [buf] is where a poll deposits fragments. C holds a borrowed pointer to
+   it for the life of the subscription, so this record is what keeps it
+   alive. Whether it may still be polled is C's to know
+   ([Subscription.closing]), since C is what the poll loop asks. *)
 type subscription =
   { sub : Subscription.t
   ; buf : Bigstring.t
-  ; mutable closed : bool
   }
 [@@deriving fields]
 
@@ -380,7 +379,7 @@ let close { client; ctx; pubs; stop; subs; _ } =
     Monitor.protect
       (fun () ->
          Deferred.List.iter subs ~how:`Parallel ~f:(fun (_, s) ->
-           s.closed <- true;
+           Subscription.mark_closed s.sub;
            Deferred.unit)
          >>= fun () ->
          Deferred.List.iter pubs ~how:`Parallel ~f:(fun (_, P x) ->
@@ -563,10 +562,10 @@ let add_exclusive_publication ({ client; pubs; stop; _ } as t) chan ~streamID en
   Exclusive x, consts
 ;;
 
-let close_subscription_aux ({ sub; _ } as t) =
-  (* Marked closed first: the poll loop must not deposit another fragment
-     into [buf] once the C side is being torn down under it. *)
-  t.closed <- true;
+let close_subscription_aux { sub; _ } =
+  (* [close] marks it closing before anything else: the poll loop must not
+     deposit another fragment into [buf] once the C side is being torn down
+     under it. *)
   Subscription.close sub;
   poll_until ~what:"close subscription" (fun () ->
     Option.some_if (Subscription.is_closed sub) ())
@@ -596,16 +595,13 @@ let is_connected { sub; _ } = Subscription.is_connected sub
 
    So: one timer for all of them, polling every subscription per pass.
 
-   What this loop must NOT do is poll harder than the reader drains.
-   [Subscription.poll] delivers each fragment to a C callback that writes
-   it into the pipe this subscription is read through, with the runtime
-   lock held and the write blocking; the only thing that can empty that
-   pipe is the Async reader on this same thread. So a poll that overruns
-   the pipe deadlocks the process against itself, permanently. That is why
-   [max_fragments] is small (see [start_polling_subscription]) and why
-   there is no re-poll-immediately fast path here: the fragment limit
-   bounds a single poll, and the period bounds how fast polls can follow
-   one another, and both bounds are what keep the pipe from filling. *)
+   And one call into C per pass, for the same reason. With a subscription
+   per venue, transport and DBN schema, the rftp bridge polls 186 of them
+   and only a handful are ever live; reaching each through a closure and
+   an OCaml-to-C transition of its own was a quarter of its cycles, spent
+   finding out that nothing had arrived. [Batch] hands C the whole array
+   and hears back only about the subscriptions that have something to
+   say. [register] stays for anything else that has to be polled. *)
 module Poller = struct
   type status =
     | Continue (** keep polling this subscription *)
@@ -618,6 +614,65 @@ module Poller = struct
     }
 
   let entries : entry list ref = ref []
+
+  (* Aeron subscriptions, polled together by [Subscription.poll_many].
+     [subs] is what C walks and [entries] what OCaml calls back, index for
+     index. Both are replaced whole rather than mutated, so a pass keeps the
+     pair it started with whatever registers or retires under it.
+     [on_poll] only runs for a subscription the call reported. *)
+  module Batch = struct
+    type entry =
+      { sub : Subscription.t
+      ; period : Time_ns.Span.t
+      ; on_poll : int -> status
+      ; mutable alive : bool
+      }
+
+    let entries : entry array ref = ref [||]
+    let subs : Subscription.t array ref = ref [||]
+    let ready = ref (Subscription.create_ready 0)
+
+    let set es =
+      entries := es;
+      subs := Array.map es ~f:(fun e -> e.sub);
+      ready := Subscription.create_ready (Array.length es)
+    ;;
+
+    let add e = set (Array.append !entries [| e |])
+    let sweep () = set (Array.filter !entries ~f:(fun e -> e.alive))
+
+    (* Whether report [k] retired its subscription. *)
+    let deliver entries ready k =
+      let e = entries.(Bigarray.Array1.get ready (2 * k)) in
+      match e.on_poll (Bigarray.Array1.get ready ((2 * k) + 1)) with
+      | Continue -> false
+      | Finished ->
+        e.alive <- false;
+        true
+      | exception exn ->
+        (* Delivery runs inside this loop, so a handler that raises would
+           otherwise take down every other subscription in the process
+           along with its own. Drop the one that raised and carry on. *)
+        Lo.err (fun m ->
+          m "aeron: dropping a subscription whose poll raised: %s" (Exn.to_string exn));
+        e.alive <- false;
+        true
+    ;;
+
+    (* Whether any subscription retired. *)
+    let pass () =
+      let entries = !entries
+      and subs = !subs
+      and ready = !ready in
+      let n = Subscription.poll_many subs (Array.length subs) ready in
+      let died = ref false in
+      for k = 0 to n - 1 do
+        if deliver entries ready k then died := true
+      done;
+      !died
+    ;;
+  end
+
   let running = ref false
   let period = ref (Time_ns.Span.of_int_ms 1)
 
@@ -631,52 +686,49 @@ module Poller = struct
      rather than being held to someone else's period -- and retiring that
      subscription lets it settle back. *)
   let recompute_period () =
-    match !entries with
-    | [] -> ()
-    | e :: es ->
-      period := List.fold es ~init:e.period ~f:(fun a e -> Time_ns.Span.min a e.period)
-  ;;
-
-  let sweep () =
-    entries := List.filter !entries ~f:(fun e -> e.alive);
-    recompute_period ()
+    let batch = Array.to_list !Batch.entries |> List.map ~f:(fun e -> e.Batch.period) in
+    let periods = List.map !entries ~f:(fun e -> e.period) @ batch in
+    Option.iter (List.min_elt periods ~compare:Time_ns.Span.compare) ~f:(fun p ->
+      period := p)
   ;;
 
   let idle () = Deferred.any [ Clock_ns.after !period; Ivar.read !wake ]
 
+  (* Whether [e] retired. *)
+  let poll_entry e =
+    match e.poll () with
+    | Continue -> false
+    | Finished ->
+      e.alive <- false;
+      true
+    | exception exn ->
+      Lo.err (fun m ->
+        m "aeron: dropping a subscription whose poll raised: %s" (Exn.to_string exn));
+      e.alive <- false;
+      true
+  ;;
+
   let rec cycle () =
-    let died = ref false in
     (* A poll can retire its own entry, and through [on_fatal] another
        one, so walk the list captured at the top of the pass and sweep the
        dead out afterwards. *)
-    List.iter !entries ~f:(fun e ->
-      if e.alive
-      then (
-        match e.poll () with
-        | Continue -> ()
-        | Finished ->
-          e.alive <- false;
-          died := true
-        | exception exn ->
-          (* Delivery runs inside this loop, so a handler that raises would
-             otherwise take down every other subscription in the process
-             along with its own. Drop the one that raised and carry on. *)
-          Lo.err (fun m ->
-            m "aeron: dropping a subscription whose poll raised: %s" (Exn.to_string exn));
-          e.alive <- false;
-          died := true));
-    if !died then sweep ();
+    let died =
+      List.fold !entries ~init:false ~f:(fun died e -> (e.alive && poll_entry e) || died)
+    in
+    let died_sub = (not (Array.is_empty !Batch.entries)) && Batch.pass () in
+    if died then entries := List.filter !entries ~f:(fun e -> e.alive);
+    if died_sub then Batch.sweep ();
+    if died || died_sub then recompute_period ();
     (* Park as soon as the last subscription goes, rather than idling out
-       one more period first: [register] restarts the loop. *)
-    if List.is_empty !entries
+       one more period first: registering restarts the loop. *)
+    if List.is_empty !entries && Array.is_empty !Batch.entries
     then (
       running := false;
       Deferred.unit)
     else idle () >>= cycle
   ;;
 
-  let register ~period poll =
-    entries := { poll; period; alive = true } :: !entries;
+  let start () =
     recompute_period ();
     if !running
     then (
@@ -686,21 +738,25 @@ module Poller = struct
       running := true;
       don't_wait_for (cycle ()))
   ;;
+
+  let register ~period poll =
+    entries := { poll; period; alive = true } :: !entries;
+    start ()
+  ;;
+
+  let register_subscription ~period sub on_poll =
+    Batch.add { Batch.sub; period; on_poll; alive = true };
+    start ()
+  ;;
 end
 
 let start_polling_subscription
       ?(stop = Deferred.never ())
       ?(period = Time_ns.Span.of_int_ms 1)
-      (* How much of [buffer_size] one pass may fill. Neither bound is a
-         correctness constraint any more -- a fragment that will not fit is
-         declined and redelivered, not dropped and not blocked on -- so
-         these only decide how much work a pass does. *)
-        ?(max_fragments = 10)
       ?(on_fatal = ignore)
       (sub : subscription)
       f
   =
-  (* Repeatedly [max_fragments] till [stop] is determined. *)
   let close_sub =
     lazy
       (Lo.debug (fun m -> m "Closing subscription");
@@ -746,37 +802,45 @@ let start_polling_subscription
     in
     go 0
   in
-  (* Join the shared poll loop. Polling and delivery are one step now: [f]
-     runs here, between the poll that filled the buffer and the next one
-     that would overwrite it. *)
-  Poller.register ~period (fun () ->
-    if sub.closed
+  (* Closing is all [stop] has to do: the next pass then reports the
+     subscription closed, which retires it. Unless it is closing already
+     -- a fatal poll, or its client gone -- and there is nothing to close. *)
+  upon stop (fun _ ->
+    if not (Subscription.closing sub.sub) then don't_wait_for (Lazy.force close_sub));
+  let fatal exn =
+    Lo.err (fun m -> m "%s" (Exn.to_string exn));
+    (* Let the caller know this subscription is dead beyond this point --
+       e.g. so a [Persistent] subscription notices and re-subscribes --
+       before tearing it down. *)
+    on_fatal exn;
+    don't_wait_for (Lazy.force close_sub);
+    Poller.Finished
+  in
+  (* What the shared loop's poll said about this subscription, when it had
+     something to say. Delivery is part of it: [f] runs here, between the
+     poll that filled the buffer and the next one that would overwrite it. *)
+  let on_poll res =
+    if res = Subscription.poll_closed
     then Poller.Finished
+    else if res < 0
+    then fatal (Subscription.poll_failure sub.sub res)
     else (
-      match
-        let nb = Aeron.Subscription.poll_exn sub.sub max_fragments in
-        if nb > 0 then drain (Aeron.Subscription.polled_bytes sub.sub);
-        nb
-      with
-      | exception exn ->
-        Lo.err (fun m -> m "%s" (Exn.to_string exn));
-        (* Let the caller know this subscription is dead beyond this
-           point -- e.g. so a [Persistent] subscription notices and
-           re-subscribes -- before tearing it down. *)
-        on_fatal exn;
-        don't_wait_for (Lazy.force close_sub);
-        Poller.Finished
-      | _nb when Deferred.is_determined stop ->
-        don't_wait_for (Lazy.force close_sub);
-        Poller.Finished
-      | _nb -> Poller.Continue))
+      match drain (Subscription.polled_bytes sub.sub) with
+      | () -> Poller.Continue
+      | exception exn -> fatal exn)
+  in
+  Poller.register_subscription ~period sub.sub on_poll
 ;;
 
 let add_subscription
       ?stop
       ?period
       ?(buffer_size = 64 * 1024)
-      ?max_fragments
+      (* How much of [buffer_size] one pass may fill. Neither bound is a
+         correctness constraint -- a fragment that will not fit is declined
+         and redelivered, not dropped and not blocked on -- so these only
+         decide how much work a pass does. *)
+      ?(max_fragments = 10)
       ?on_fatal
       t
       uri
@@ -792,14 +856,15 @@ let add_subscription
   (* Bounded for the same reason publication's [add] is (see [poll_until]):
      a driver that has stopped answering must not turn this into an
      unbounded wait. *)
-  poll_until ~what:"add subscription" (fun () -> Aeron.Subscription.add_poll sub_req buf)
+  poll_until ~what:"add subscription" (fun () ->
+    Aeron.Subscription.add_poll sub_req buf ~fragment_limit:max_fragments)
   >>= function
   | Error _ as e -> return e
   | Ok sub ->
     let consts = Subscription.consts sub in
-    let sub = Fields_of_subscription.create ~sub ~buf ~closed:false in
+    let sub = Fields_of_subscription.create ~sub ~buf in
     Hashtbl.set t.subs ~key:consts.registration_id ~data:sub;
-    start_polling_subscription ?stop ?period ?max_fragments ?on_fatal sub f;
+    start_polling_subscription ?stop ?period ?on_fatal sub f;
     Deferred.Or_error.return (sub, consts)
 ;;
 

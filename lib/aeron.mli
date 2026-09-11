@@ -134,11 +134,22 @@ module Subscription : sig
 
   val add : conn -> Uri.t -> int32 -> add
 
-  (** [add_poll add data] completes the subscription and points it at [data],
-      the buffer [poll_exn] deposits fragments into. C borrows that buffer for
+  (** [add_poll add data ~fragment_limit] completes the subscription and
+      points it at [data], the buffer a poll deposits fragments into, taking
+      at most [fragment_limit] of them each time. C borrows that buffer for
       the life of the subscription, so the caller must keep it reachable. *)
-  val add_poll : add -> Bigstringaf.t -> t option
+  val add_poll : add -> Bigstringaf.t -> fragment_limit:int -> t option
+
+  (** Also marks [t] {!closing}, before anything else. *)
   val close : t -> unit
+
+  (** Marks [t] {!closing} without touching the C subscription: for one
+      whose client is already closed, which freed it. *)
+  val mark_closed : t -> unit
+
+  (** [close] or [mark_closed] was called: polls skip [t] from then on. *)
+  val closing : t -> bool
+
   val is_closed : t -> bool
   val is_connected : t -> bool
 
@@ -148,18 +159,47 @@ module Subscription : sig
 
   val consts : t -> consts
 
-  (** [poll_exn t limit] takes up to [limit] fragments into the buffer given
-      to [add_poll] -- each an [aeron_header_values_t] then its payload --
-      and answers how many it took. A fragment that will not fit is left
-      unconsumed and redelivered by the next poll, so a short answer means
-      "drain and call again", never a loss.
+  (** [poll_exn t] takes up to [fragment_limit] fragments into the buffer
+      given to [add_poll] -- each an [aeron_header_values_t] then its
+      payload -- and answers how many it took, 0 once [t] is {!closing}. A
+      fragment that will not fit is left unconsumed and redelivered by the
+      next poll, so a short answer means "drain and call again", never a
+      loss.
 
       Raises if one fragment could not fit an empty buffer, which is
       otherwise a silent livelock; that means the buffer is smaller than
       [aeron.mtu.length]. *)
-  val poll_exn : t -> int -> int
+  val poll_exn : t -> int
 
-  (** Bytes the last [poll_exn] wrote: how much of the buffer to walk. *)
+  (** Where {!poll_many} reports, two slots per subscription. *)
+  type ready = (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
+
+  (** Room for [n] subscriptions' reports. *)
+  val create_ready : int -> ready
+
+  (** [poll_many subs n ready] polls [subs.(0)] to [subs.(n - 1)], as
+      [poll_exn] would, in a single call into C, and answers how many of
+      them had something to report. Report [k] is the index at
+      [ready.{2k}] and the result at [ready.{2k + 1}]: a fragment count
+      when positive, {!poll_closed} for a subscription that was skipped,
+      and otherwise a failure to hand to {!poll_failure}. Subscriptions
+      that took nothing are not reported. [ready] needs room for [n].
+
+      Stops at a failure, leaving the subscriptions after it for the next
+      call, so that the failure can still be described. Never allocates:
+      the whole point is that polling an idle subscription costs as little
+      as Aeron itself makes it. *)
+  val poll_many : t array -> int -> ready -> int
+
+  (** The {!poll_many} result of a {!closing} subscription. *)
+  val poll_closed : int
+
+  (** What [poll_exn] would have raised for a failed {!poll_many} result.
+      Ask straight away: the message behind an Aeron error is only held
+      until the next Aeron call. *)
+  val poll_failure : t -> int -> exn
+
+  (** Bytes the last poll wrote: how much of the buffer to walk. *)
   val polled_bytes : t -> int
 end
 

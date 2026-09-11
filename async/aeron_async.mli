@@ -77,9 +77,10 @@ val do_work_exn : t -> unit
 type subscription
 
 (** Every subscription in the process is drained by one shared poll loop,
-    not by a timer of its own. [period] (default 1ms) is how long that loop
-    idles between passes; the loop as a whole runs at the shortest period
-    any live subscription asked for.
+    not by a timer of its own, and each pass polls all of them in a single
+    call into C. [period] (default 1ms) is how long that loop idles between
+    passes; the loop as a whole runs at the shortest period any live
+    subscription asked for.
 
     Fragments are copied straight into a [buffer_size] (default 64K)
     Bigstring owned by this subscription and handed to [f] from the poll

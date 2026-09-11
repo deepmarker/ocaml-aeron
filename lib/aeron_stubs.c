@@ -465,9 +465,12 @@ struct ml_aeron_sub {
     size_t buf_len;
     size_t written;    // bytes filled by the poll in progress
     size_t overflow;   // a fragment too big for [buf] at all, else 0
+    size_t limit;      // fragments one poll may take
+    size_t closed;     // closing or its client gone: never poll [sub] again
 };
 
-CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba, value data) {
+CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba, value data,
+                                                    value limit) {
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     int ret = aeron_async_add_subscription_poll(&sub->sub, Ptr_val(async));
     if (ret == 1) {
@@ -475,13 +478,30 @@ CAMLprim value ml_aeron_async_add_subscription_poll(value async, value ba, value
         sub->buf_len = Caml_ba_array_val(data)->dim[0];
         sub->written = 0;
         sub->overflow = 0;
+        sub->limit = Long_val(limit);
+        sub->closed = 0;
     }
     return Val_int(ret);
+}
+
+// Only the flag: for a subscription whose client is already gone, which
+// took the C object with it and leaves nothing to close.
+CAMLprim value ml_aeron_subscription_mark_closed(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    sub->closed = 1;
+    return Val_unit;
+}
+
+CAMLprim value ml_aeron_subscription_closing(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return Val_bool(sub->closed);
 }
 
 CAMLprim value ml_aeron_subscription_close(value ba) {
     CAMLparam1(ba);
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    // Flagged first: no poll may reach [sub->sub] once it is being torn down.
+    sub->closed = 1;
     int ret = aeron_subscription_close(sub->sub, NULL, NULL);
     if (ret < 0) {
         caml_failwith(aeron_errmsg());
@@ -644,28 +664,63 @@ static aeron_controlled_fragment_handler_action_t poll_handler(
     return AERON_ACTION_CONTINUE;
 }
 
-CAMLprim value ml_aeron_subscription_poll(value ba, value limit) {
-    CAMLparam2(ba, limit);
-    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+// What a poll answers instead of a fragment count. Codes rather than
+// exceptions so that the polls below never enter the OCaml runtime: they
+// back [@@noalloc] externals, which skip [caml_c_call]'s stack switch and
+// the root registration, and an idle poll is almost nothing but that.
+// Mirrored in aeron.ml.
+#define POLL_ERROR (-1)    // Aeron failed; [aeron_errmsg] says why
+#define POLL_OVERFLOW (-2) // one fragment does not fit even an empty buffer
+#define POLL_CLOSED (-3)   // closing, or its client is gone: not polled
+
+static intnat poll_one(struct ml_aeron_sub *sub) {
+    if (sub->closed)
+        return POLL_CLOSED;
     sub->written = 0;
     sub->overflow = 0;
-    int nb_read = aeron_subscription_controlled_poll(sub->sub,
-                                                     poll_handler,
-                                                     sub,
-                                                     Long_val(limit));
+    int nb_read = aeron_subscription_controlled_poll(sub->sub, poll_handler, sub, sub->limit);
     if (nb_read < 0)
-        caml_failwith(aeron_errmsg());
+        return POLL_ERROR;
     // Only fatal if the buffer was empty and the fragment still would not
     // fit; otherwise there is simply draining to do first.
-    if (sub->overflow != 0 && sub->written == 0) {
-        char msg[192];
-        snprintf(msg, sizeof(msg),
-                 "aeron: a %zu byte fragment does not fit the %zu byte subscription "
-                 "buffer; raise it or lower aeron.mtu.length",
-                 sub->overflow, sub->buf_len);
-        caml_failwith(msg);
+    if (sub->overflow != 0 && sub->written == 0)
+        return POLL_OVERFLOW;
+    return nb_read;
+}
+
+intnat ml_aeron_subscription_poll_unboxed(value ba) {
+    return poll_one(Caml_ba_data_val(ba));
+}
+
+CAMLprim value ml_aeron_subscription_poll(value ba) {
+    return Val_long(ml_aeron_subscription_poll_unboxed(ba));
+}
+
+// Polls the first [n] subscriptions of [subs], an OCaml array, in one call:
+// a process with a subscription per stream and few streams live pays one
+// transition per pass instead of one per subscription. Only the ones with
+// something to say are reported, as (index, result) pairs in [ready], which
+// has room for [n] of them. Stops at the first failure, so that
+// [aeron_errmsg] is still that subscription's when OCaml asks for it; the
+// rest are polled next pass.
+intnat ml_aeron_subscription_poll_many_unboxed(value subs, intnat n, value ready) {
+    intnat *out = Caml_ba_data_val(ready);
+    intnat k = 0;
+    for (intnat i = 0; i < n; i++) {
+        intnat res = poll_one(Caml_ba_data_val(Field(subs, i)));
+        if (res == 0)
+            continue;
+        out[2 * k] = i;
+        out[2 * k + 1] = res;
+        k++;
+        if (res == POLL_ERROR || res == POLL_OVERFLOW)
+            break;
     }
-    CAMLreturn(Val_int(nb_read));
+    return k;
+}
+
+CAMLprim value ml_aeron_subscription_poll_many(value subs, value n, value ready) {
+    return Val_long(ml_aeron_subscription_poll_many_unboxed(subs, Long_val(n), ready));
 }
 
 // Bytes [poll] just appended, i.e. how much of the buffer OCaml should
@@ -673,6 +728,17 @@ CAMLprim value ml_aeron_subscription_poll(value ba, value limit) {
 CAMLprim value ml_aeron_subscription_polled_bytes(value ba) {
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     return Val_long(sub->written);
+}
+
+// For the POLL_OVERFLOW message, built in OCaml.
+CAMLprim value ml_aeron_subscription_overflow(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return Val_long(sub->overflow);
+}
+
+CAMLprim value ml_aeron_subscription_buffer_length(value ba) {
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    return Val_long(sub->buf_len);
 }
 
 CAMLprim value alloc_claim(value unit) {

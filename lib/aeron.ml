@@ -296,18 +296,19 @@ module Subscription = struct
     -> Bigstringaf.t
     -> Bigstringaf.t
     -> int
+    -> int
     = "ml_aeron_async_add_subscription_poll"
 
   (* [data] is where [poll] deposits fragments. C keeps a borrowed pointer
      to it for the life of the subscription, so the caller has to hold on
      to it -- a Bigstring is off-heap and never moved by the GC, but it is
      still freed when nothing references it. *)
-  let add_poll add data =
-    (* Five words: the subscription pointer, then [data]'s address and
-       length, then the poll's byte count and overflow flag. C fills all of
-       them; see [struct ml_aeron_sub]. *)
-    let buf = Bigstringaf.create (5 * Sys.word_size / 8) in
-    match add_poll add buf data with
+  let add_poll add data ~fragment_limit =
+    (* Seven words: the subscription pointer, [data]'s address and length,
+       the poll's byte count and overflow, the fragment limit and the
+       closed flag. C fills all of them; see [struct ml_aeron_sub]. *)
+    let buf = Bigstringaf.create (7 * Sys.word_size / 8) in
+    match add_poll add buf data fragment_limit with
     | -1 -> failwith (errmsg ())
     | 0 -> None
     | 1 -> Some buf
@@ -318,6 +319,12 @@ module Subscription = struct
 
   external close : Bigstringaf.t -> unit = "ml_aeron_subscription_close"
 
+  external mark_closed : Bigstringaf.t -> unit = "ml_aeron_subscription_mark_closed"
+  [@@noalloc]
+
+  external closing : Bigstringaf.t -> bool = "ml_aeron_subscription_closing"
+  [@@noalloc]
+
   external is_closed : Bigstringaf.t -> bool = "ml_aeron_subscription_is_closed"
   [@@noalloc]
 
@@ -326,15 +333,58 @@ module Subscription = struct
 
   external status : Bigstringaf.t -> int = "ml_aeron_subscription_channel_status"
   external consts : Bigstringaf.t -> consts = "ml_aeron_subscription_constants"
-  (* Fills the buffer given to [add_poll] with up to [limit] fragments, each
-     an [aeron_header_values_t] followed by its payload, and answers how many
-     it took. A fragment that does not fit is left unconsumed and comes back
-     on the next poll (AERON_ACTION_ABORT), so a short return means "drain
-     and call again", never a loss. Raises only if a single fragment could
-     not fit an empty buffer. *)
-  external poll_exn : Bigstringaf.t -> int -> int = "ml_aeron_subscription_poll"
+  (* The codes a poll answers with instead of a fragment count, besides -1
+     for an Aeron error; see POLL_* in aeron_stubs.c. *)
+  let poll_overflow = -2
+  let poll_closed = -3
 
-  (* Bytes the last [poll_exn] wrote, i.e. how much of the buffer to walk. *)
+  (* Fills the buffer given to [add_poll] with up to [fragment_limit]
+     fragments, each an [aeron_header_values_t] followed by its payload, and
+     answers how many it took. A fragment that does not fit is left
+     unconsumed and comes back on the next poll (AERON_ACTION_ABORT), so a
+     short return means "drain and call again", never a loss. *)
+  external poll
+    :  Bigstringaf.t
+    -> (int[@untagged])
+    = "ml_aeron_subscription_poll" "ml_aeron_subscription_poll_unboxed"
+  [@@noalloc]
+
+  type ready = (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
+
+  let create_ready n = Bigarray.Array1.create Bigarray.int Bigarray.c_layout (2 * n)
+
+  external poll_many
+    :  Bigstringaf.t array
+    -> (int[@untagged])
+    -> ready
+    -> (int[@untagged])
+    = "ml_aeron_subscription_poll_many" "ml_aeron_subscription_poll_many_unboxed"
+  [@@noalloc]
+
+  external overflow : Bigstringaf.t -> int = "ml_aeron_subscription_overflow"
+  [@@noalloc]
+
+  external buffer_length : Bigstringaf.t -> int = "ml_aeron_subscription_buffer_length"
+  [@@noalloc]
+
+  let poll_failure t code =
+    if code = poll_overflow
+    then
+      Failure
+        (Printf.sprintf
+           "aeron: a %d byte fragment does not fit the %d byte subscription buffer; \
+            raise it or lower aeron.mtu.length"
+           (overflow t)
+           (buffer_length t))
+    else Failure (errmsg ())
+  ;;
+
+  let poll_exn t =
+    let n = poll t in
+    if n >= 0 then n else if n = poll_closed then 0 else raise (poll_failure t n)
+  ;;
+
+  (* Bytes the last poll wrote, i.e. how much of the buffer to walk. *)
   external polled_bytes : Bigstringaf.t -> int = "ml_aeron_subscription_polled_bytes"
   [@@noalloc]
 end
