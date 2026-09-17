@@ -153,6 +153,9 @@ module Subscription : sig
   val is_closed : t -> bool
   val is_connected : t -> bool
 
+  (** Currently available image correlation IDs. Empty on a closing subscription. *)
+  val image_ids : t -> int64 array
+
   (** Weirdly returns -1 for IPC transport. Supposed to return 1 on
       success and -1 on error. *)
   val status : t -> int

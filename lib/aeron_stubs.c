@@ -519,6 +519,32 @@ CAMLprim value ml_aeron_subscription_is_connected(value ba) {
     return(Val_bool(aeron_subscription_is_connected(sub->sub)));
 }
 
+// Correlation IDs distinguish images even when a session ID is reused.
+// Take/release each image reference before allocating its boxed OCaml ID.
+CAMLprim value ml_aeron_subscription_image_ids(value ba) {
+    CAMLparam1(ba);
+    CAMLlocal2(ids, id);
+    struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
+    int n = sub->closed ? 0 : aeron_subscription_image_count(sub->sub);
+    if (n < 0) caml_failwith(aeron_errmsg());
+    ids = caml_alloc(n, 0);
+    for (int i = 0; i < n; i++) Store_field(ids, i, Val_unit);
+    for (int i = 0; i < n; i++) {
+        aeron_image_t *image = aeron_subscription_image_at_index(sub->sub, i);
+        int64_t correlation = 0;
+        if (image != NULL) {
+            aeron_image_constants_t constants;
+            int ret = aeron_image_constants(image, &constants);
+            aeron_image_release(image);
+            if (ret < 0) caml_failwith(aeron_errmsg());
+            correlation = constants.correlation_id;
+        }
+        id = caml_copy_int64(correlation);
+        Store_field(ids, i, id);
+    }
+    CAMLreturn(ids);
+}
+
 CAMLprim value ml_aeron_subscription_channel_status(value ba) {
     struct ml_aeron_sub *sub = Caml_ba_data_val(ba);
     return(Val_long(aeron_subscription_channel_status(sub->sub)));

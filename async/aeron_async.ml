@@ -1054,6 +1054,13 @@ module Persistent = struct
       >>|? fun { Conn.sub; _ } -> Aeron.Subscription.consts sub.sub
     ;;
 
+    let image_ids_now t =
+      match M.current_connection t with
+      | Some { Conn.sub; closed } when not (Ivar.is_full closed) ->
+        Some (Aeron.Subscription.image_ids sub.sub)
+      | _ -> None
+    ;;
+
     let is_connected t =
       M.connected_or_failed_to_connect t
       >>|? fun { Conn.sub; _ } -> is_connected sub
@@ -1068,5 +1075,6 @@ module Persistent = struct
   ;;
 
   let close_subscription (sub : subscription) = Subscription.close sub
+  let image_ids_now (sub : subscription) = Subscription.image_ids_now sub
   let is_connected (sub : subscription) = Subscription.is_connected sub
 end

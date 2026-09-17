@@ -331,6 +331,8 @@ module Subscription = struct
   external is_connected : Bigstringaf.t -> bool = "ml_aeron_subscription_is_connected"
   [@@noalloc]
 
+  external image_ids : t -> int64 array = "ml_aeron_subscription_image_ids"
+
   external status : Bigstringaf.t -> int = "ml_aeron_subscription_channel_status"
   external consts : Bigstringaf.t -> consts = "ml_aeron_subscription_constants"
   (* The codes a poll answers with instead of a fragment count, besides -1

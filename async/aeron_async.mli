@@ -264,5 +264,10 @@ module Persistent : sig
     -> (subscription * Subscription.consts) Deferred.Or_error.t
 
   val close_subscription : subscription -> unit Deferred.t
+  (** Nonblocking image identity snapshot. [None] means the owning client or
+      subscription is unavailable; useful for invalidating accepted state on
+      image loss even when other publishers keep the subscription connected. *)
+  val image_ids_now : subscription -> int64 array option
+
   val is_connected : subscription -> bool Deferred.Or_error.t
 end
