@@ -109,6 +109,17 @@ val add_subscription
 val close_subscription : t -> subscription -> unit Deferred.t
 val is_connected : subscription -> bool
 
+(** Polls that came back with a full fragment budget, process-wide and
+    monotonic. A pass that drains exactly [max_fragments] is one that had
+    more waiting, so a rising count means a stream is consistently asking
+    for more than its budget -- either raise [max_fragments] for it, or
+    accept that it is bounded by how fast the handler can take delivery.
+
+    Export it. A silently saturated poll is indistinguishable from a quiet
+    one in every other metric: the consumer reports everything it did
+    deliver and nothing about what it could not reach. *)
+val saturated_polls : unit -> int
+
 (** Publication *)
 
 module Encoder : sig

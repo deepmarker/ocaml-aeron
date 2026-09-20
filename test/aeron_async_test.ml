@@ -82,12 +82,21 @@ let test_idle_polls_once_per_period () =
   check bool "did not spin" true (!polls < 60)
 ;;
 
-(* The loop must never poll faster than its period, however much there is
-   to read. Fragments reach OCaml through a 64K pipe that a blocking C
-   callback fills while holding the runtime lock, and the only reader is
-   the Async thread running this loop -- so a loop that re-polls without
-   idling can overrun the pipe and deadlock the process against itself.
-   That is not hypothetical: it hung the rftp bridge on its first burst. *)
+(* A [register]ed poll -- anything that is not an Aeron subscription --
+   never runs faster than its period, however busy the scheduler is.
+   It reports no work count, so the loop cannot tell a pass that found
+   something from one that did not, and idles either way.
+
+   This once applied to subscriptions too, and for a reason: fragments
+   reached OCaml through a 64K pipe that a blocking C callback filled
+   while holding the runtime lock, with this loop as the only reader, so
+   re-polling without idling could overrun the pipe and deadlock the
+   process against itself -- it hung the rftp bridge on its first burst.
+   That delivery path is gone. Fragments now land straight in the
+   subscription's own buffer and are drained inside the poll callback,
+   so a saturated subscription is re-polled immediately, which is what
+   Aeron's own idle-strategy contract asks for. See the loop in
+   [Aeron_async.Poller]. *)
 let test_never_polls_faster_than_its_period () =
   let polls = ref 0 in
   let stop = ref false in

@@ -625,6 +625,10 @@ module Poller = struct
       { sub : Subscription.t
       ; period : Time_ns.Span.t
       ; on_poll : int -> status
+      ; limit : int
+        (* The fragment limit this subscription was polled with. A pass
+           that comes back with [limit] fragments drained exactly its
+           budget, which is how the loop knows more is waiting. *)
       ; mutable alive : bool
       }
 
@@ -659,17 +663,30 @@ module Poller = struct
         true
     ;;
 
-    (* Whether any subscription retired. *)
+    (* Passes that filled their whole budget: the one signal that says a
+       stream is running hot, and the one the loop used to discard. *)
+    let saturated_passes = ref 0
+
+    (* Whether any subscription retired, and whether any drained its full
+       budget -- meaning there is more waiting for it right now. *)
     let pass () =
       let entries = !entries
       and subs = !subs
       and ready = !ready in
       let n = Subscription.poll_many subs (Array.length subs) ready in
       let died = ref false in
+      let saturated = ref false in
       for k = 0 to n - 1 do
+        let e = entries.(Bigarray.Array1.get ready (2 * k)) in
+        (* Positive is a fragment count; [poll_closed] and failures are
+           not, and never reach [limit]. *)
+        if Bigarray.Array1.get ready ((2 * k) + 1) >= e.limit
+        then (
+          saturated := true;
+          Int.incr saturated_passes);
         if deliver entries ready k then died := true
       done;
-      !died
+      !died, !saturated
     ;;
   end
 
@@ -715,7 +732,9 @@ module Poller = struct
     let died =
       List.fold !entries ~init:false ~f:(fun died e -> (e.alive && poll_entry e) || died)
     in
-    let died_sub = (not (Array.is_empty !Batch.entries)) && Batch.pass () in
+    let died_sub, saturated =
+      if Array.is_empty !Batch.entries then false, false else Batch.pass ()
+    in
     if died then entries := List.filter !entries ~f:(fun e -> e.alive);
     if died_sub then Batch.sweep ();
     if died || died_sub then recompute_period ();
@@ -725,6 +744,21 @@ module Poller = struct
     then (
       running := false;
       Deferred.unit)
+    else if saturated
+    then
+      (* Aeron's own contract, which this loop used to break: an idle
+         strategy is handed the work count and returns without sleeping
+         when there was any -- `if (work_count > 0) { return; }` in
+         aeron_idle_strategy_sleeping_idle, and the same early return in
+         aeron-go's BackoffIdleStrategy. Sleeping the period after a full
+         pass instead turned the fragment limit into a throughput ceiling
+         of limit/period, which is what left one feed five minutes behind
+         while its producer queued gigabytes.
+         Yield rather than spin: the limit still bounds how long a pass
+         holds the scheduler, and other Async jobs get their turn between
+         passes, but a stream with more waiting is polled again now rather
+         than a period later. *)
+      Scheduler.yield () >>= cycle
     else idle () >>= cycle
   ;;
 
@@ -744,16 +778,23 @@ module Poller = struct
     start ()
   ;;
 
-  let register_subscription ~period sub on_poll =
-    Batch.add { Batch.sub; period; on_poll; alive = true };
+  let register_subscription ~period ~limit sub on_poll =
+    Batch.add { Batch.sub; period; on_poll; limit; alive = true };
     start ()
   ;;
 end
+
+(* Passes that drained their full fragment budget, process-wide. A rising
+   count is a stream asking for a bigger budget or a faster consumer; it is
+   the reading that was unavailable while a 10-fragment default silently
+   capped a feed at 10k fragments/s. *)
+let saturated_polls () = !Poller.Batch.saturated_passes
 
 let start_polling_subscription
       ?(stop = Deferred.never ())
       ?(period = Time_ns.Span.of_int_ms 1)
       ?(on_fatal = ignore)
+      ~max_fragments
       (sub : subscription)
       f
   =
@@ -829,7 +870,7 @@ let start_polling_subscription
       | () -> Poller.Continue
       | exception exn -> fatal exn)
   in
-  Poller.register_subscription ~period sub.sub on_poll
+  Poller.register_subscription ~period ~limit:max_fragments sub.sub on_poll
 ;;
 
 let add_subscription
@@ -864,7 +905,7 @@ let add_subscription
     let consts = Subscription.consts sub in
     let sub = Fields_of_subscription.create ~sub ~buf in
     Hashtbl.set t.subs ~key:consts.registration_id ~data:sub;
-    start_polling_subscription ?stop ?period ?on_fatal sub f;
+    start_polling_subscription ?stop ?period ?on_fatal ~max_fragments sub f;
     Deferred.Or_error.return (sub, consts)
 ;;
 
